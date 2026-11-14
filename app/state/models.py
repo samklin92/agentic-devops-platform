@@ -51,6 +51,7 @@ class IncidentContext(AgentContract):
     environment: str = Field(min_length=1)
     namespace: str | None = None
     pod_name: str | None = None
+    deployment: str | None = None
     source: str = "manual"
     received_at: datetime = Field(default_factory=utc_now)
 
