@@ -385,10 +385,15 @@ def build_devops_graph(
 def build_devops_graph_async(
     embedding_model: Any,
     tools: dict[str, Callable[..., Any] | ToolDefinition],
-    client: Any,
+    client: Any = None,
     approved_actions: set[str] | None = None,
+    include_response: bool = True,
 ):
-    """Build a LangGraph workflow that supports asynchronous tools."""
+    """Build an asynchronous DevOps investigation workflow.
+
+    When include_response is False, the graph returns investigation
+    evidence without generating a user-facing response.
+    """
 
     workflow = StateGraph(DevOpsGraphState)
 
@@ -399,45 +404,46 @@ def build_devops_graph_async(
             approved_actions,
         )
 
-    workflow.add_node(
-        "retrieve_knowledge",
-        lambda state: retrieve_knowledge_node(state, embedding_model),
-    )
+    def retrieve_node(state: DevOpsGraphState):
+        if embedding_model is None:
+            return {"knowledge": []}
 
-    workflow.add_node(
-        "select_action",
-        select_diagnostic_action_node,
-    )
+        return retrieve_knowledge_node(state, embedding_model)
 
-    workflow.add_node(
-        "execute_tool",
-        execute_tool_node,
-    )
-
-    workflow.add_node(
-        "evaluate_evidence",
-        evaluate_evidence_node,
-    )
-
-    workflow.add_node(
-        "generate_response",
-        lambda state: generate_final_response_node(state, client),
-    )
+    workflow.add_node("retrieve_knowledge", retrieve_node)
+    workflow.add_node("select_action", select_diagnostic_action_node)
+    workflow.add_node("execute_tool", execute_tool_node)
+    workflow.add_node("evaluate_evidence", evaluate_evidence_node)
 
     workflow.add_edge(START, "retrieve_knowledge")
     workflow.add_edge("retrieve_knowledge", "select_action")
     workflow.add_edge("select_action", "execute_tool")
     workflow.add_edge("execute_tool", "evaluate_evidence")
 
+    if include_response:
+        if client is None:
+            raise ValueError(
+                "A client is required when include_response is True."
+            )
+
+        workflow.add_node(
+            "generate_response",
+            lambda state: generate_final_response_node(state, client),
+        )
+
+        stop_destination = "generate_response"
+        workflow.add_edge("generate_response", END)
+
+    else:
+        stop_destination = END
+
     workflow.add_conditional_edges(
         "evaluate_evidence",
         route_after_evaluation,
         {
             "continue": "select_action",
-            "stop": "generate_response",
+            "stop": stop_destination,
         },
     )
-
-    workflow.add_edge("generate_response", END)
 
     return workflow.compile()

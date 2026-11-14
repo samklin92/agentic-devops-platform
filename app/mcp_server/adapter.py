@@ -1,56 +1,96 @@
-"""Adapters connecting the DevOps agent to Kubernetes MCP tools."""
+"""Adapter connecting the Kubernetes agent to MCP tools."""
 
 from typing import Any
+
+
+def _validate_response(response: Any, tool_name: str) -> dict:
+    """Validate MCP transport and application-level responses."""
+
+    if response.is_error:
+        raise RuntimeError(
+            f"MCP tool '{tool_name}' returned an error."
+        )
+
+    content = response.structured_content
+
+    if not isinstance(content, dict):
+        raise RuntimeError(
+            f"MCP tool '{tool_name}' returned an invalid response."
+        )
+
+    if content.get("error"):
+        raise RuntimeError(
+            f"MCP tool '{tool_name}': {content['error']}"
+        )
+
+    return content
 
 
 def build_mcp_tools(
     session: Any,
     pod_name: str,
+    namespace: str,
 ) -> dict:
-    """Build agent-compatible asynchronous handlers from MCP tools."""
+    """Build namespace-aware diagnostic tools for the Kubernetes agent."""
 
     async def inspect_pod_events() -> dict:
-        """Retrieve Kubernetes events for the target pod."""
-
         response = await session.call_tool(
             "get_pod_events",
-            arguments={"pod_name": pod_name},
+            arguments={
+                "pod_name": pod_name,
+                "namespace": namespace,
+            },
         )
 
-        if response.is_error:
-            raise RuntimeError("MCP failed to retrieve pod events.")
-
-        return response.structured_content
+        return _validate_response(
+            response,
+            "get_pod_events",
+        )
 
     async def gather_additional_diagnostics() -> dict:
-        """Collect pod details, container logs and deployment health."""
-
-        pod = await session.call_tool(
+        pod_response = await session.call_tool(
             "inspect_pod",
-            arguments={"pod_name": pod_name},
+            arguments={
+                "pod_name": pod_name,
+                "namespace": namespace,
+            },
         )
 
-        logs = await session.call_tool(
+        logs_response = await session.call_tool(
             "get_container_logs",
-            arguments={"pod_name": pod_name},
+            arguments={
+                "pod_name": pod_name,
+                "namespace": namespace,
+            },
         )
 
-        deployment = await session.call_tool(
+        deployment_response = await session.call_tool(
             "check_deployment_status",
-            arguments={"deployment_name": pod_name},
+            arguments={
+                "deployment_name": pod_name,
+                "namespace": namespace,
+            },
         )
 
-        responses = [pod, logs, deployment]
+        pod = _validate_response(
+            pod_response,
+            "inspect_pod",
+        )
 
-        if any(response.is_error for response in responses):
-            raise RuntimeError(
-                "MCP failed to collect additional diagnostics."
-            )
+        logs = _validate_response(
+            logs_response,
+            "get_container_logs",
+        )
+
+        deployment = _validate_response(
+            deployment_response,
+            "check_deployment_status",
+        )
 
         return {
-            "pod": pod.structured_content,
-            "logs": logs.structured_content,
-            "deployment": deployment.structured_content,
+            "pod": pod,
+            "logs": logs,
+            "deployment": deployment,
             "terminal": True,
         }
 
