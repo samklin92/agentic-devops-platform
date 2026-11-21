@@ -446,4 +446,8 @@ def build_devops_graph_async(
         },
     )
 
-    return workflow.compile()
+    # The agent graph runs inside the Supervisor's checkpointed graph (see
+    # app/supervisor/kubernetes_bridge.py). checkpointer=False stops it from
+    # inheriting the Supervisor's checkpointer, which would overwrite the
+    # Supervisor's thread state and lose the approval pause.
+    return workflow.compile(checkpointer=False)
