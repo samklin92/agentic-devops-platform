@@ -52,6 +52,11 @@ class IncidentContext(AgentContract):
     namespace: str | None = None
     pod_name: str | None = None
     deployment: str | None = None
+    # Monitoring identity for the Observability specialist. Phase 1
+    # convenience: when unset, the metrics target falls back to
+    # `deployment`. In real infrastructure a Kubernetes Deployment name
+    # and a monitoring service identity are not necessarily the same.
+    service: str | None = None
     source: str = "manual"
     received_at: datetime = Field(default_factory=utc_now)
 

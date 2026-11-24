@@ -76,6 +76,52 @@ def test_incident_context_rejects_empty_description_and_extra_fields():
             surprise="field",
         )
 
+def test_incident_context_service_defaults_to_none():
+    assert make_incident().service is None
+
+
+def test_incident_context_accepts_service():
+    incident = IncidentContext(
+        incident_id="i",
+        description="p95 latency is elevated",
+        environment="production",
+        namespace="production",
+        service="checkout-api",
+    )
+    assert incident.service == "checkout-api"
+
+
+def test_incident_context_loads_payload_without_service():
+    # Models serialized before the field existed must still load.
+    payload = make_incident().model_dump(mode="json")
+    payload.pop("service")
+    restored = IncidentContext.model_validate(payload)
+    assert restored.service is None
+
+
+def test_incident_context_service_round_trips():
+    incident = IncidentContext(
+        incident_id="i",
+        description="p95 latency is elevated",
+        environment="production",
+        service="checkout-api",
+    )
+    restored = IncidentContext.model_validate(
+        incident.model_dump(mode="json")
+    )
+    assert restored.service == "checkout-api"
+
+
+def test_incident_context_whitespace_service_is_stripped_to_empty():
+    incident = IncidentContext(
+        incident_id="i",
+        description="p95 latency is elevated",
+        environment="production",
+        service="   ",
+    )
+    # Empty is falsy, so `service or deployment` falls back to deployment.
+    assert incident.service == ""
+    assert not incident.service
 
 def test_routing_requires_at_least_one_specialist():
     with pytest.raises(ValidationError):
