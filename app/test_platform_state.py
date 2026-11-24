@@ -18,6 +18,11 @@ from app.state.graph_state import (
 )
 from app.state.models import CallLimits, Finding, IncidentContext, UsageRecord
 
+from app.state.adapters import (
+    MAX_SUMMARY_CHARS,
+    finding_from_kubernetes_response,
+    is_execution_failure,
+)
 
 def make_incident() -> IncidentContext:
     return IncidentContext(
@@ -164,3 +169,45 @@ def test_adapter_truncates_long_summaries():
     finding = finding_from_kubernetes_response(response)
     assert len(finding.summary) == MAX_SUMMARY_CHARS
     assert finding.summary.endswith("...")
+
+def failure_evidence(tool: str = "inspect_pod_events") -> AgentEvidence:
+    return AgentEvidence(
+        source_tool=tool,
+        observation='{"error": "MCP server unreachable", "execution_failed": true}',
+    )
+
+
+def test_adapter_does_not_count_failed_tool_runs_as_evidence():
+    response = KubernetesInvestigationResponse(
+        incident_id="inc-001",
+        status="completed",
+        findings=["inspect_pod_events: failed"],
+        evidence=[failure_evidence()],
+        evidence_quality="limited",
+    )
+    finding = finding_from_kubernetes_response(response)
+    assert finding.evidence_quality == "insufficient"
+    assert len(finding.evidence) == 1  # kept for the audit trail
+
+
+def test_adapter_keeps_quality_when_real_evidence_sits_beside_a_failure():
+    response = KubernetesInvestigationResponse(
+        incident_id="inc-001",
+        status="partial",
+        findings=["mixed results"],
+        evidence=[
+            AgentEvidence(
+                source_tool="get_pod_status", observation="CrashLoopBackOff"
+            ),
+            failure_evidence("gather_additional_diagnostics"),
+        ],
+        evidence_quality="limited",
+    )
+    assert finding_from_kubernetes_response(response).evidence_quality == "limited"
+
+
+def test_is_execution_failure_only_matches_failure_records():
+    assert is_execution_failure('{"execution_failed": true, "error": "x"}')
+    assert not is_execution_failure('{"execution_failed": false}')
+    assert not is_execution_failure("CrashLoopBackOff")
+    assert not is_execution_failure("[1, 2]")

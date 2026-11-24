@@ -1,9 +1,20 @@
 """Adapters from existing agent contracts to platform state records."""
 
+import json
+
 from app.contracts.agent_messages import KubernetesInvestigationResponse
 from app.state.models import Finding
 
 MAX_SUMMARY_CHARS = 500
+
+
+def is_execution_failure(observation: str) -> bool:
+    """True if an observation records a failed tool run, not a diagnostic."""
+    try:
+        payload = json.loads(observation)
+    except (TypeError, ValueError):
+        return False
+    return isinstance(payload, dict) and payload.get("execution_failed") is True
 
 
 def finding_from_kubernetes_response(
@@ -20,8 +31,14 @@ def finding_from_kubernetes_response(
     if len(summary) > MAX_SUMMARY_CHARS:
         summary = summary[: MAX_SUMMARY_CHARS - 3] + "..."
 
-    # Never claim evidence quality without evidence.
-    quality = response.evidence_quality if response.evidence else "insufficient"
+    # The agent records failed tool runs as observations. They stay in the
+    # finding for the audit trail but never count as diagnostic evidence.
+    diagnostic = [
+        item
+        for item in response.evidence
+        if not is_execution_failure(item.observation)
+    ]
+    quality = response.evidence_quality if diagnostic else "insufficient"
 
     return Finding(
         agent_name="kubernetes",
