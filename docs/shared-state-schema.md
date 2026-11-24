@@ -1,8 +1,12 @@
 # Shared State Schema
 
-Status: Phase 1, Task 1. Implemented in `app/state/`, tested by
-`app/test_state_models.py`, `app/test_platform_state.py`,
-`app/test_state_serde.py` and `app/test_platform_lifecycle.py`.
+Status: Phase 1, Task 1. Implemented in `app/state/`. The Supervisor
+that uses it is documented in `docs/supervisor-graph.md`.
+
+Tests: `app/test_state_models.py`, `app/test_platform_state.py`,
+`app/test_state_serde.py` and `app/test_platform_lifecycle.py` (a stub
+graph that exercises every state field). The Supervisor tests are listed
+in `docs/supervisor-graph.md`.
 
 ## Purpose
 
@@ -29,7 +33,7 @@ call each other; they read and write shared state through the Supervisor.
 
 | Record | Purpose | Enforced rules |
 |---|---|---|
-| `IncidentContext` | The alert that started the incident | Non-empty ID, description, environment; unknown fields rejected |
+| `IncidentContext` | The alert that started the incident | Non-empty ID, description, environment; unknown fields rejected; optional `namespace`, `pod_name` and `deployment` (a remediation proposal needs `namespace` and `deployment`) |
 | `RoutingDecision` | Supervisor's choice of specialists | At least one agent; only `kubernetes`, `observability`, `security`; reason required |
 | `Finding` | One specialist's conclusion and its evidence | Evidence quality above `insufficient` requires evidence; `attempt >= 1`; `contradicts` links conflicting findings |
 | `ProposedAction` | A remediation proposal | At least one supporting finding ID; action type from a closed list; risk level required |
@@ -57,34 +61,43 @@ call each other; they read and write shared state through the Supervisor.
 | `findings` | Specialists | Append |
 | `usage` | Any agent | Append |
 | `audit_log` | Any actor | Append |
-| `agent_call_counts` | Specialists | Per-key sum |
+| `agent_call_counts` | Supervisor, per specialist call | Per-key sum |
 | `supervisor_hops` | Supervisor | Sum |
 
 Helpers: `new_platform_state`, `check_call_budget` (per-agent and
-per-incident limits), `supervisor_hops_exhausted`, `summarize_usage`
-(tokens and cost per agent), `merge_counts`.
+per-incident limits, used by the Supervisor before every specialist
+call), `supervisor_hops_exhausted`, `summarize_usage` (tokens and cost
+per agent), `merge_counts`.
 
 ## Adapters (`app/state/adapters.py`)
 
 `finding_from_kubernetes_response` converts the existing
-`KubernetesInvestigationResponse` into a `Finding`. It downgrades
-`evidence_quality` to `insufficient` when no evidence exists and
-truncates long summaries to 500 characters. Observability and Security
-adapters will be added with those agents.
+`KubernetesInvestigationResponse` into a `Finding`.
+
+- It downgrades `evidence_quality` to `insufficient` when no diagnostic
+  evidence exists.
+- The Kubernetes agent records failed tool runs as observations carrying
+  `"execution_failed": true`. These stay in the finding for the audit
+  trail, but they never count as diagnostic evidence
+  (`is_execution_failure`).
+- Summaries longer than 500 characters are truncated.
+
+Observability and Security adapters will be added with those agents.
 
 ## Incident lifecycle: CrashLoopBackOff walkthrough
 
-Validated end to end by `test_incident_lifecycle_approved` and
-`test_incident_lifecycle_rejected`, including a simulated process
-restart between pause and resume.
+Validated two ways: `app/test_platform_lifecycle.py` runs a stub graph
+that touches every state field, and the Supervisor tests run the same
+lifecycle through the real graph (see `docs/supervisor-graph.md`). Both
+include a simulated process restart between pause and resume.
 
 | # | Step | State written | Audit event |
 |---|---|---|---|
 | 1 | Alert received | `incident`, `status=received`, `supervisor_hops` | `alert_received` |
 | 2 | Supervisor routes to Kubernetes | `routing`, `status=investigating` | `routed` |
-| 3 | Kubernetes agent investigates | `agent_call_counts`, `usage` | `kubernetes_investigated` |
+| 3 | Kubernetes agent investigates | `agent_call_counts` (and `usage`, once agents make LLM calls) | `kubernetes_investigated` |
 | 4 | Findings and evidence recorded | `findings` (with `AgentEvidence`) | |
-| 5 | Supervisor evaluates | Reads `evidence_quality`, `needs_follow_up` | |
+| 5 | Supervisor evaluates | Reads `status`, `evidence_quality`, `needs_follow_up` | |
 | 6 | Supervisor proposes rollout restart | `proposed_action`, `status=awaiting_approval` | `action_proposed` |
 | 7 | Graph pauses at the interrupt | Checkpoint saved to SQLite | |
 | 8 | Engineer approves or rejects | `approval` | `approval_granted` / `approval_rejected` |
@@ -107,18 +120,29 @@ On rejection, step 10 is skipped and the report outcome is
   automatically.
 - A node that calls `interrupt()` re-runs from its top on resume, so
   nothing before the `interrupt()` call may have side effects.
+- A graph that runs inside a Supervisor node must be compiled with
+  `checkpointer=False`. Otherwise it inherits the Supervisor's
+  checkpointer and overwrites the Supervisor's thread state, which loses
+  the approval pause. The async Kubernetes agent graph is compiled this
+  way.
 
 ## Known limitations
 
-- The lifecycle tests use a stub graph. The real Supervisor, routing
-  logic and evidence correlation are not built yet.
 - Only a Kubernetes adapter exists.
-- The rule "do not propose an action on `insufficient` evidence" is a
-  Supervisor decision and is not yet enforced in code or tests.
-- `check_call_budget` is exercised in tests but not yet wired into real
-  agents. The existing global `MAX_TOOL_CALLS` in `tool_executor.py`
-  remains as the inner safety net.
-- `UsageRecord` is not yet populated by real LLM calls.
+- `UsageRecord` is never populated: the current Kubernetes agent run
+  makes no LLM calls.
+- `evidence_quality` from the Kubernetes agent is only `insufficient` or
+  `limited`. `corroborated` is defined but nothing produces it yet.
+- An empty tool result (for example no pod events) still counts as
+  evidence, so a failed investigation of an unknown pod reports quality
+  `limited`. The Supervisor's evidence gate still rejects it, because the
+  finding is not `completed`.
+- `Finding.contradicts` is not used yet; there is no evidence correlation
+  logic.
+- `IncidentReport.root_cause` is never populated.
+- Execution is simulated only.
+
+Supervisor-level limitations are listed in `docs/supervisor-graph.md`.
 
 ## Extending the schema
 
