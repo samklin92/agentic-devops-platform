@@ -1,4 +1,4 @@
-"""Read-only MCP server for Kubernetes diagnostics."""
+"""Read-only MCP server for Kubernetes diagnostics and service metrics."""
 
 from mcp.server import MCPServer
 
@@ -6,7 +6,10 @@ from mcp.server import MCPServer
 mcp = MCPServer(
     name="devops-kubernetes-server",
     version="1.0.0",
-    instructions="Provides read-only Kubernetes diagnostic tools."
+    instructions=(
+        "Provides read-only Kubernetes diagnostic tools and "
+        "read-only service metrics tools."
+    ),
 )
 
 
@@ -124,6 +127,75 @@ SIMULATED_DEPLOYMENTS = {
 }
 
 
+# Service metrics, identified by (namespace, service). Values are the
+# simulated state over whatever window the caller asks for.
+
+MIN_WINDOW_MINUTES = 1
+MAX_WINDOW_MINUTES = 1440
+
+SIMULATED_ERROR_RATES = {
+    ("production", "payment-api"): {"error_rate_pct": 0.2},
+    ("production", "inventory-api"): {"error_rate_pct": 98.0},
+    ("staging", "inventory-api"): {"error_rate_pct": 0.1},
+    ("production", "checkout-api"): {"error_rate_pct": 2.1},
+}
+
+SIMULATED_LATENCY = {
+    ("production", "payment-api"): {
+        "p50_ms": 45, "p95_ms": 120, "p99_ms": 210,
+    },
+    ("production", "inventory-api"): {
+        "p50_ms": 800, "p95_ms": 5000, "p99_ms": 8000,
+    },
+    ("staging", "inventory-api"): {
+        "p50_ms": 40, "p95_ms": 90, "p99_ms": 160,
+    },
+    ("production", "checkout-api"): {
+        "p50_ms": 600, "p95_ms": 2400, "p99_ms": 4800,
+    },
+}
+
+SIMULATED_RESOURCE_USAGE = {
+    ("production", "payment-api"): {
+        "cpu_pct_of_limit": 35, "memory_pct_of_limit": 40,
+    },
+    ("production", "inventory-api"): {
+        "cpu_pct_of_limit": 5, "memory_pct_of_limit": 10,
+    },
+    ("staging", "inventory-api"): {
+        "cpu_pct_of_limit": 20, "memory_pct_of_limit": 30,
+    },
+    ("production", "checkout-api"): {
+        "cpu_pct_of_limit": 96, "memory_pct_of_limit": 61,
+    },
+}
+
+
+def _window_error(window_minutes: int) -> dict[str, str] | None:
+    """Return an error result if the window is not a bounded positive int."""
+    if (
+        isinstance(window_minutes, bool)
+        or not isinstance(window_minutes, int)
+        or not MIN_WINDOW_MINUTES <= window_minutes <= MAX_WINDOW_MINUTES
+    ):
+        return {
+            "error": (
+                "window_minutes must be an integer between "
+                f"{MIN_WINDOW_MINUTES} and {MAX_WINDOW_MINUTES}."
+            )
+        }
+    return None
+
+
+def _service_not_found(service: str, namespace: str) -> dict[str, str]:
+    return {
+        "error": (
+            f"Service '{service}' was not found "
+            f"in namespace '{namespace}'."
+        )
+    }
+
+
 @mcp.tool(
     name="inspect_pod",
     description="Inspect a Kubernetes pod's status and details.",
@@ -208,6 +280,89 @@ def check_deployment_status(
         }
 
     return deployment
+
+
+@mcp.tool(
+    name="get_error_rate",
+    description="Get a service's error rate over a recent time window.",
+    structured_output=True,
+)
+def get_error_rate(
+    service: str,
+    namespace: str,
+    window_minutes: int = 15,
+) -> dict[str, str | int | float]:
+    """Retrieve the error rate for a service in a specific namespace."""
+
+    window_error = _window_error(window_minutes)
+    if window_error is not None:
+        return window_error
+
+    data = SIMULATED_ERROR_RATES.get((namespace, service))
+    if data is None:
+        return _service_not_found(service, namespace)
+
+    return {
+        "service": service,
+        "namespace": namespace,
+        "window_minutes": window_minutes,
+        **data,
+    }
+
+
+@mcp.tool(
+    name="get_latency_percentiles",
+    description=(
+        "Get a service's p50, p95 and p99 latency over a recent time window."
+    ),
+    structured_output=True,
+)
+def get_latency_percentiles(
+    service: str,
+    namespace: str,
+    window_minutes: int = 15,
+) -> dict[str, str | int | float]:
+    """Retrieve latency percentiles for a service in a specific namespace."""
+
+    window_error = _window_error(window_minutes)
+    if window_error is not None:
+        return window_error
+
+    data = SIMULATED_LATENCY.get((namespace, service))
+    if data is None:
+        return _service_not_found(service, namespace)
+
+    return {
+        "service": service,
+        "namespace": namespace,
+        "window_minutes": window_minutes,
+        **data,
+    }
+
+
+@mcp.tool(
+    name="get_resource_usage",
+    description=(
+        "Get a service's current CPU and memory usage as a percentage "
+        "of its limits."
+    ),
+    structured_output=True,
+)
+def get_resource_usage(
+    service: str,
+    namespace: str,
+) -> dict[str, str | int | float]:
+    """Retrieve resource usage for a service in a specific namespace."""
+
+    data = SIMULATED_RESOURCE_USAGE.get((namespace, service))
+    if data is None:
+        return _service_not_found(service, namespace)
+
+    return {
+        "service": service,
+        "namespace": namespace,
+        **data,
+    }
 
 
 if __name__ == "__main__":

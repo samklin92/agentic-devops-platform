@@ -16,6 +16,20 @@ from app.langgraph_agent import build_devops_graph_async
 
 from app.mcp_server import server as kubernetes_server 
 
+KUBERNETES_TOOLS = {
+    "inspect_pod",
+    "get_pod_events",
+    "get_container_logs",
+    "check_deployment_status",
+}
+
+METRICS_TOOLS = {
+    "get_error_rate",
+    "get_latency_percentiles",
+    "get_resource_usage",
+}
+
+
 def test_mcp_server_registers_all_diagnostic_tools():
 
     result = asyncio.run(mcp.list_tools())
@@ -24,14 +38,8 @@ def test_mcp_server_registers_all_diagnostic_tools():
         tool.name for tool in result
     }
 
-    expected_tools = {
-        "inspect_pod",
-        "get_pod_events",
-        "get_container_logs",
-        "check_deployment_status",
-    }
-
-    assert registered_tool_names == expected_tools
+    assert registered_tool_names == KUBERNETES_TOOLS | METRICS_TOOLS
+    assert KUBERNETES_TOOLS.isdisjoint(METRICS_TOOLS)
 
 def test_adapter_inspects_pod_events():
 
@@ -266,7 +274,6 @@ def test_same_pod_name_returns_different_resources_by_namespace():
     assert production_pod["namespace"] == "production"
     assert staging_pod["namespace"] == "staging"
 
-
 def test_pod_lookup_rejects_unknown_namespace():
     result = kubernetes_server.inspect_pod(
         pod_name="inventory-api",
@@ -274,7 +281,6 @@ def test_pod_lookup_rejects_unknown_namespace():
     )
 
     assert "error" in result
-
 
 def test_container_logs_are_namespace_specific():
     production_logs = kubernetes_server.get_container_logs(
@@ -311,3 +317,72 @@ def test_deployment_lookup_is_namespace_specific():
 
     assert production_deployment["status"] == "Degraded"
     assert staging_deployment["status"] == "Healthy"
+
+def test_metric_tools_return_distinct_scenarios():
+    healthy = kubernetes_server.get_error_rate(
+        service="payment-api", namespace="production"
+    )
+    failing = kubernetes_server.get_error_rate(
+        service="inventory-api", namespace="production"
+    )
+    assert healthy["error_rate_pct"] < 1
+    assert failing["error_rate_pct"] > 90
+
+
+def test_metric_tools_are_namespace_specific():
+    production = kubernetes_server.get_latency_percentiles(
+        service="inventory-api", namespace="production"
+    )
+    staging = kubernetes_server.get_latency_percentiles(
+        service="inventory-api", namespace="staging"
+    )
+    assert production["p95_ms"] == 5000
+    assert staging["p95_ms"] == 90
+    assert production["namespace"] == "production"
+    assert staging["namespace"] == "staging"
+
+
+def test_resource_usage_shows_cpu_saturation_scenario():
+    usage = kubernetes_server.get_resource_usage(
+        service="checkout-api", namespace="production"
+    )
+    assert usage["cpu_pct_of_limit"] >= 90
+    assert usage["memory_pct_of_limit"] < 90
+
+
+def test_metric_tools_return_error_for_unknown_service():
+    for result in (
+        kubernetes_server.get_error_rate("ghost", "production", 15),
+        kubernetes_server.get_latency_percentiles("ghost", "production", 15),
+        kubernetes_server.get_resource_usage("ghost", "production"),
+    ):
+        assert "error" in result
+
+
+def test_metric_tools_echo_the_window():
+    result = kubernetes_server.get_error_rate(
+        service="payment-api", namespace="production", window_minutes=30
+    )
+    assert result["window_minutes"] == 30
+
+
+def test_metric_window_accepts_the_bounds():
+    for window in (
+        kubernetes_server.MIN_WINDOW_MINUTES,
+        kubernetes_server.MAX_WINDOW_MINUTES,
+    ):
+        result = kubernetes_server.get_error_rate(
+            "payment-api", "production", window
+        )
+        assert "error" not in result
+
+
+@pytest.mark.parametrize("window", [0, -5, 1441, True, 1.5, "15"])
+def test_metric_window_rejects_invalid_values(window):
+    for result in (
+        kubernetes_server.get_error_rate("payment-api", "production", window),
+        kubernetes_server.get_latency_percentiles(
+            "payment-api", "production", window
+        ),
+    ):
+        assert "error" in result
