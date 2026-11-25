@@ -33,5 +33,13 @@
   {"id": "r32", "category": "single", "incident": "CPU saturation on the checkout service", "expected": ["observability"]},
   {"id": "r33", "category": "single", "incident": "Memory pressure on the orders service", "expected": ["observability"]},
   {"id": "r34", "category": "multi", "incident": "Memory pressure and OOMKilled pods on the orders service", "expected": ["kubernetes", "observability"]},
-  {"id": "r35", "category": "single", "incident": "Pod payment-api-5d8f is stuck in Pending", "expected": ["kubernetes"]}
+  {"id": "r35", "category": "single", "incident": "Pod payment-api-5d8f is stuck in Pending", "expected": ["kubernetes"]},
+  {"id": "r36", "category": "single", "incident": "Spike in failed logins against the checkout-api", "expected": ["security"]},
+  {"id": "r37", "category": "single", "incident": "IAM role used by payment-api is getting AccessDenied responses", "expected": ["security"]},
+  {"id": "r38", "category": "single", "incident": "The checkout-api security group allows 0.0.0.0/0 ingress", "expected": ["security"]},
+  {"id": "r39", "category": "single", "incident": "Root login detected on the production AWS account", "expected": ["security"]},
+  {"id": "r40", "category": "multi", "incident": "Failed logins and CPU saturation on checkout-api", "expected": ["observability", "security"]},
+  {"id": "r41", "category": "multi", "incident": "Exposed credentials found in inventory-api pod logs", "expected": ["kubernetes", "security"]},
+  {"id": "r42", "category": "out_of_scope", "incident": "Password reset emails are not being delivered", "expected": []},
+  {"id": "r43", "category": "single", "hard": true, "incident": "Someone is signing in to the admin console from a country we do not operate in", "expected": ["security"]}
 ]

@@ -1,3 +1,5 @@
+import pytest
+
 from app.state.models import IncidentContext
 from app.supervisor.routing import (
     SIGNAL_RULES,
@@ -105,3 +107,29 @@ def test_named_pod_plus_metrics_signal_routes_to_both():
     )
     decision = route_incident(incident)
     assert decision.selected_agents == ["kubernetes", "observability"]
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("Spike in failed logins against the checkout-api", ["security"]),
+        (
+            "IAM role used by payment-api is getting AccessDenied responses",
+            ["security"],
+        ),
+        ("The checkout-api security group allows 0.0.0.0/0 ingress", ["security"]),
+        ("Root login detected on the production AWS account", ["security"]),
+        (
+            "Failed logins and CPU saturation on checkout-api",
+            ["observability", "security"],
+        ),
+        (
+            "Exposed credentials found in inventory-api pod logs",
+            ["kubernetes", "security"],
+        ),
+        ("Password reset emails are not being delivered", []),
+    ],
+)
+def test_security_signals_route_without_false_positives(text, expected):
+    assert agents(text) == expected
+
