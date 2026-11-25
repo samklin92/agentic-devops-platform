@@ -24,6 +24,45 @@ EvidenceQuality = Literal["insufficient", "limited", "corroborated"]
 ActionType = Literal[
     "rollout_restart", "scale_deployment", "delete_pod", "other"
 ]
+# Closed vocabulary of structured signals. A signal is emitted only when
+# the diagnostic check that supports it succeeded. Missing data is never
+# a signal, and never counts as a clean result.
+SignalName = Literal[
+    "crash_loop",
+    "errors_elevated",
+    "latency_elevated",
+    "cpu_saturated",
+    "memory_near_limit",
+    "failed_auth_elevated",
+    "iam_denied_elevated",
+    "credential_stale",
+    "publicly_exposed",
+    "open_ingress",
+]
+# Each specialist may emit only its own signals.
+SIGNALS_BY_AGENT: dict[str, frozenset[str]] = {
+    "kubernetes": frozenset({"crash_loop"}),
+    "observability": frozenset(
+        {
+            "errors_elevated",
+            "latency_elevated",
+            "cpu_saturated",
+            "memory_near_limit",
+        }
+    ),
+    "security": frozenset(
+        {
+            "failed_auth_elevated",
+            "iam_denied_elevated",
+            "credential_stale",
+            "publicly_exposed",
+            "open_ingress",
+        }
+    ),
+}
+# How two findings relate. A closed list: correlation annotates evidence
+# and never authorizes anything.
+CorrelationKind = Literal["corroborates", "contradicts", "co_occurs"]
 ApprovalStatus = Literal["pending", "approved", "rejected"]
 ExecutionStatus = Literal["simulated", "skipped", "failed"]
 IncidentOutcome = Literal[
@@ -79,6 +118,9 @@ class Finding(AgentContract):
     evidence: list[AgentEvidence] = Field(default_factory=list)
     evidence_quality: EvidenceQuality = "insufficient"
     needs_follow_up: bool = False
+    # Structured signals for Supervisor correlation. Empty by default, so
+    # records serialized before this field existed still load.
+    signals: list[SignalName] = Field(default_factory=list)
     attempt: int = Field(default=1, ge=1)
     contradicts: list[str] = Field(default_factory=list)
     error_message: str | None = None
@@ -89,6 +131,53 @@ class Finding(AgentContract):
         if self.evidence_quality != "insufficient" and not self.evidence:
             raise ValueError(
                 "Evidence quality above 'insufficient' requires evidence."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def signals_must_be_valid_and_backed(self) -> "Finding":
+        if not self.signals:
+            return self
+        if len(set(self.signals)) != len(self.signals):
+            raise ValueError("Signals must not repeat.")
+        foreign = set(self.signals) - SIGNALS_BY_AGENT[self.agent_name]
+        if foreign:
+            raise ValueError(
+                f"Agent '{self.agent_name}' cannot emit signals "
+                f"{sorted(foreign)}."
+            )
+        if self.status in ("failed", "blocked"):
+            raise ValueError(
+                "A failed or blocked finding cannot carry signals: "
+                "missing data is never a signal."
+            )
+        if not self.evidence:
+            raise ValueError("Signals require evidence.")
+        return self
+
+
+class Correlation(AgentContract):
+    """A relationship the Supervisor found between two or more findings.
+
+    Written only by the Supervisor. It annotates evidence and never
+    changes a finding, a proposal or an approval.
+    """
+
+    correlation_id: str = Field(default_factory=new_id)
+    kind: CorrelationKind
+    rule: str = Field(min_length=1)
+    finding_ids: list[str] = Field(min_length=2)
+    explanation: str = Field(min_length=1)
+    correlated_at: datetime = Field(default_factory=utc_now)
+
+    @model_validator(mode="after")
+    def finding_ids_must_be_distinct(self) -> "Correlation":
+        if any(not finding_id.strip() for finding_id in self.finding_ids):
+            raise ValueError("Finding IDs must not be blank.")
+        if len(set(self.finding_ids)) != len(self.finding_ids):
+            raise ValueError(
+                "A correlation needs at least two distinct finding IDs, "
+                "each listed once."
             )
         return self
 

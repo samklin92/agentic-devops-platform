@@ -1,3 +1,5 @@
+from typing import Annotated, get_origin, get_type_hints
+
 from langgraph.graph import END, START, StateGraph
 
 from app.contracts.agent_messages import (
@@ -48,6 +50,16 @@ def test_new_state_starts_empty_with_default_limits():
     assert state["findings"] == []
     assert state["agent_call_counts"] == {}
     assert state["limits"] == CallLimits()
+    assert state["correlations"] == []
+
+
+def test_correlations_are_supervisor_written_with_no_reducer():
+    hints = get_type_hints(PlatformState, include_extras=True)
+    # Append-only fields carry a reducer so specialists can write safely.
+    assert get_origin(hints["findings"]) is Annotated
+    # Correlations do not: only the Supervisor writes them, and it
+    # recomputes the whole list from the current findings each time.
+    assert get_origin(hints["correlations"]) is not Annotated
 
 
 def test_call_budget_enforces_agent_and_incident_limits():

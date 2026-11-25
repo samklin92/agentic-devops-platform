@@ -1,3 +1,5 @@
+from typing import get_args
+
 import pytest
 from pydantic import ValidationError
 
@@ -6,12 +8,16 @@ from app.state.models import (
     ApprovalRecord,
     AuditEntry,
     CallLimits,
+    Correlation,
+    CorrelationKind,
     ExecutionRecord,
     Finding,
     IncidentContext,
     IncidentReport,
     ProposedAction,
     RoutingDecision,
+    SIGNALS_BY_AGENT,
+    SignalName,
     UsageRecord,
 )
 from app.tool_executor import MAX_TOOL_CALLS
@@ -33,6 +39,17 @@ def make_finding(**overrides) -> Finding:
     }
     data.update(overrides)
     return Finding(**data)
+
+
+def make_correlation(**overrides) -> Correlation:
+    data = {
+        "kind": "corroborates",
+        "rule": "unhealthy_workload",
+        "finding_ids": ["finding-1", "finding-2"],
+        "explanation": "Two specialists report signals about the same workload.",
+    }
+    data.update(overrides)
+    return Correlation(**data)
 
 
 def make_action(**overrides) -> ProposedAction:
@@ -223,6 +240,11 @@ def test_incident_report_rejects_unknown_outcome():
         make_incident(),
         RoutingDecision(selected_agents=["kubernetes"], reason="CrashLoop"),
         make_finding(),
+        make_finding(
+            agent_name="observability",
+            signals=["errors_elevated", "latency_elevated"],
+        ),
+        make_correlation(),
         make_action(),
         ApprovalRecord(action_id="a"),
         ApprovalRecord(action_id="a", status="approved", decided_by="sam"),
@@ -246,3 +268,139 @@ def test_json_round_trip_preserves_every_record(model):
     """Checkpointing serializes state, so every record must survive JSON."""
     restored = type(model).model_validate_json(model.model_dump_json())
     assert restored == model
+
+
+# ---- structured signals ----
+
+
+def test_finding_signals_default_to_empty():
+    assert make_finding().signals == []
+
+
+def test_finding_loads_payload_without_signals():
+    # Findings serialized before the field existed must still load.
+    payload = make_finding().model_dump(mode="json")
+    payload.pop("signals")
+    restored = Finding.model_validate(payload)
+    assert restored.signals == []
+
+
+@pytest.mark.parametrize(
+    "agent, signals",
+    [
+        ("kubernetes", ["crash_loop"]),
+        ("observability", ["errors_elevated", "cpu_saturated"]),
+        ("security", ["failed_auth_elevated", "open_ingress"]),
+    ],
+)
+def test_finding_accepts_signals_from_its_own_vocabulary(agent, signals):
+    finding = make_finding(agent_name=agent, signals=signals)
+    assert finding.signals == signals
+
+
+def test_finding_rejects_unknown_signals():
+    with pytest.raises(ValidationError):
+        make_finding(signals=["on_fire"])
+
+
+@pytest.mark.parametrize(
+    "agent, signal",
+    [
+        ("kubernetes", "cpu_saturated"),
+        ("observability", "crash_loop"),
+        ("observability", "publicly_exposed"),
+        ("security", "errors_elevated"),
+    ],
+)
+def test_finding_rejects_another_agents_signal(agent, signal):
+    with pytest.raises(ValidationError, match="cannot emit"):
+        make_finding(agent_name=agent, signals=[signal])
+
+
+def test_finding_rejects_repeated_signals():
+    with pytest.raises(ValidationError, match="must not repeat"):
+        make_finding(
+            agent_name="observability",
+            signals=["errors_elevated", "errors_elevated"],
+        )
+
+
+def test_finding_signals_require_evidence():
+    with pytest.raises(ValidationError, match="require evidence"):
+        make_finding(
+            evidence=[], evidence_quality="insufficient", signals=["crash_loop"]
+        )
+
+
+@pytest.mark.parametrize("status", ["failed", "blocked"])
+def test_failed_or_blocked_finding_cannot_carry_signals(status):
+    with pytest.raises(ValidationError, match="missing data"):
+        make_finding(status=status, signals=["crash_loop"])
+
+
+@pytest.mark.parametrize("status", ["completed", "partial", "needs_review"])
+def test_other_statuses_may_carry_signals(status):
+    assert make_finding(status=status, signals=["crash_loop"]).signals
+
+
+def test_signal_vocabulary_is_closed_and_owned_by_exactly_one_agent():
+    assert set(SIGNALS_BY_AGENT) == {"kubernetes", "observability", "security"}
+    owned = [signal for group in SIGNALS_BY_AGENT.values() for signal in group]
+    assert len(owned) == len(set(owned))
+    assert set(owned) == set(get_args(SignalName))
+
+
+# ---- correlations ----
+
+
+def test_correlation_valid_and_defaults():
+    correlation = make_correlation()
+    assert correlation.correlation_id
+    assert correlation.kind == "corroborates"
+    assert correlation.correlated_at is not None
+
+
+def test_correlation_ids_are_unique():
+    assert make_correlation().correlation_id != make_correlation().correlation_id
+
+
+def test_correlation_kinds_are_a_closed_list():
+    assert set(get_args(CorrelationKind)) == {
+        "corroborates",
+        "contradicts",
+        "co_occurs",
+    }
+    with pytest.raises(ValidationError):
+        make_correlation(kind="causes")
+
+
+@pytest.mark.parametrize("field", ["rule", "explanation"])
+@pytest.mark.parametrize("value", ["", "   "])
+def test_correlation_requires_rule_and_explanation(field, value):
+    with pytest.raises(ValidationError):
+        make_correlation(**{field: value})
+
+
+@pytest.mark.parametrize(
+    "ids",
+    [[], ["finding-1"], ["finding-1", "finding-1"], ["a", "b", "a"]],
+)
+def test_correlation_needs_two_distinct_finding_ids(ids):
+    with pytest.raises(ValidationError):
+        make_correlation(finding_ids=ids)
+
+
+@pytest.mark.parametrize("ids", [["a", ""], ["a", "   "]])
+def test_correlation_rejects_blank_finding_ids(ids):
+    with pytest.raises(ValidationError):
+        make_correlation(finding_ids=ids)
+
+
+def test_correlation_rejects_extra_fields():
+    with pytest.raises(ValidationError):
+        make_correlation(authorizes_action=True)
+
+
+def test_correlation_accepts_more_than_two_distinct_findings():
+    correlation = make_correlation(finding_ids=["a", "b", "c"])
+    assert len(correlation.finding_ids) == 3

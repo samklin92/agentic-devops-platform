@@ -7,6 +7,7 @@ from app.state.models import (
     ApprovalRecord,
     AuditEntry,
     CallLimits,
+    Correlation,
     ExecutionRecord,
     Finding,
     IncidentContext,
@@ -48,6 +49,10 @@ class PlatformState(TypedDict):
     approval: ApprovalRecord | None
     execution: ExecutionRecord | None
     report: IncidentReport | None
+    # Written only by the Supervisor, with no reducer. Recomputed from the
+    # current findings every time, never accumulated, so a repeated
+    # investigation cannot leave stale relationships behind.
+    correlations: list[Correlation]
 
     # Safe for specialists to write: reducers merge concurrent updates.
     findings: Annotated[list[Finding], operator.add]
@@ -71,6 +76,7 @@ def new_platform_state(
         "approval": None,
         "execution": None,
         "report": None,
+        "correlations": [],
         "findings": [],
         "usage": [],
         "audit_log": [],
