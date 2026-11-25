@@ -33,7 +33,7 @@ call each other; they read and write shared state through the Supervisor.
 
 | Record | Purpose | Enforced rules |
 |---|---|---|
-| `IncidentContext` | The alert that started the incident | Non-empty ID, description, environment; unknown fields rejected; optional `namespace`, `pod_name`, `deployment` and `service` (a remediation proposal needs `namespace` and `deployment`; the Observability specialist targets `service`, falling back to `deployment`, which is a Phase 1 convenience because a Kubernetes Deployment name and a monitoring service identity are not necessarily the same) |
+| `IncidentContext` | The alert that started the incident | Non-empty ID, description, environment; unknown fields rejected; optional `namespace`, `pod_name`, `deployment` and `service` (a remediation proposal needs `namespace` and `deployment`; the Observability and Security specialists target `service`, falling back to `deployment`, which is a Phase 1 convenience because a Kubernetes Deployment name and a monitoring or security service identity are not necessarily the same) |
 | `RoutingDecision` | Supervisor's choice of specialists | At least one agent; only `kubernetes`, `observability`, `security`; reason required |
 | `Finding` | One specialist's conclusion and its evidence | Evidence quality above `insufficient` requires evidence; `attempt >= 1`; `contradicts` links conflicting findings |
 | `ProposedAction` | A remediation proposal | At least one supporting finding ID; action type from a closed list; risk level required |
@@ -82,7 +82,7 @@ per agent), `merge_counts`.
   (`is_execution_failure`).
 - Summaries longer than 500 characters are truncated.
 
-The Observability specialist has no separate response contract: `app/supervisor/observability.py` builds its `Finding` directly from the metric results, and follows the same convention for failed tool runs (a JSON observation with `"execution_failed": true`, kept in the finding but never counted as diagnostic evidence). A Security adapter will be added with that agent.
+The Observability and Security specialists have no separate response contract: `app/supervisor/observability.py` and `app/supervisor/security.py` build their `Finding` directly from the tool results, and follow the same convention for failed tool runs (a JSON observation with `"execution_failed": true`, kept in the finding but never counted as diagnostic evidence).
 
 ## Incident lifecycle: CrashLoopBackOff walkthrough
 
@@ -128,10 +128,10 @@ On rejection, step 10 is skipped and the report outcome is
 
 ## Known limitations
 
-- Only the Kubernetes and Observability specialists exist; there is no Security specialist yet.
+- Only the Kubernetes, Observability and Security specialists exist.
 - `UsageRecord` is never populated: the current Kubernetes agent run
   makes no LLM calls.
-- `evidence_quality` is only `insufficient` or `limited` from both existing specialists. `corroborated` is defined but nothing produces it yet. Observability deliberately does not produce it: its metrics are correlated signals, so two agreeing metrics are not independent evidence. It will be assigned by the later evidence-correlation step, when findings from different specialists agree.
+- `evidence_quality` is only `insufficient` or `limited` from all three specialists. `corroborated` is defined but nothing produces it yet. Observability deliberately does not produce it: its metrics are correlated signals, so two agreeing metrics are not independent evidence. Security does not produce it either: its three checks are separate signals about one workload, not confirmation from another specialist. It will be assigned by the later evidence-correlation step, when findings from different specialists agree.
 - An empty tool result (for example no pod events) still counts as
   evidence, so a failed investigation of an unknown pod reports quality
   `limited`. The Supervisor's evidence gate still rejects it, because the

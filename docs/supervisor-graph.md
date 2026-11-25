@@ -36,16 +36,21 @@ Kubernetes signal. No match returns `None`, and the incident is
 escalated to a human in the report. Every decision lists the signals
 that fired.
 
-Measured by `python -m app.evaluate_routing` on 35 labelled incidents
+Measured by `python -m app.evaluate_routing` on 43 labelled incidents
 (`evals/routing_questions.json`). At the time of writing the baseline
-gets 33 of 35 exactly right, with precision 1.00 for every specialist
-and recall 0.93 for Kubernetes and Observability. The two misses are
-deliberately keyword-free cases marked `hard` (an exit code 137 restart
-loop and a vague customer-impact report). They mark the limit of rules
-and the bar an LLM router would have to beat. The set was extended when
-the Observability specialist was added (mixed crash-loop and HTTP 500
-cases, metrics-only cases, and a pod with no metrics signal that must
-not route to Observability), and Kubernetes precision did not change.
+gets 40 of 43 exactly right, with precision 1.00 for every specialist,
+recall 0.93 for Kubernetes and 0.94 for Observability and Security, and
+all 5 out-of-scope cases handled. The three misses are deliberately
+keyword-free cases marked `hard` (an exit code 137 restart loop, a vague
+customer-impact report and a sign-in from an unfamiliar country). They
+mark the limit of rules and the bar an LLM router would have to beat.
+The set was extended when the Observability specialist was added (mixed
+crash-loop and HTTP 500 cases, metrics-only cases, and a pod with no
+metrics signal that must not route to Observability) and again for
+Security (failed logins, IAM access denied, open ingress, root login,
+mixed Observability and Kubernetes cases, and password reset emails as
+a false-positive guard). Kubernetes precision did not change either
+time.
 
 `memory pressure` routes to Observability, as a resource metric. The
 Kubernetes node condition `MemoryPressure` is a different thing: written
@@ -102,6 +107,19 @@ stdio for each investigation, with a 20 second timeout on
 (`build_mcp_tools`) and closes the session afterwards. The server is
 started with `sys.executable`, never a bare `python`. A server that
 cannot start becomes a failed finding.
+`stdio_observability_investigator()` and `stdio_security_investigator()`
+do the same for the two MCP-backed specialists, which open one session
+per investigation.
+
+## Shared specialist helpers (`app/supervisor/specialist_common.py`)
+
+The Observability and Security investigators share one pattern, so the
+identical parts live here: the target resolver (`service`, falling back
+to `deployment`, with a `namespace` required), the allowlist guard, the
+runner that contains each tool failure separately, field validation and
+the MCP session wrapper. The module knows no allowlist. Each specialist
+passes its own, so the allowlists stay independent. Observability still
+exports the same names, so its tests did not change.
 
 ## Observability investigator (`app/supervisor/observability.py`)
 
@@ -145,10 +163,67 @@ authorize remediation.
 
 The tools are allowlisted in `OBSERVABILITY_TOOL_ALLOWLIST`, separate
 from the Kubernetes allowlist. The guard rejects every other tool name,
-including the four Kubernetes MCP tools, and that rejection is not
-swallowed as an ordinary tool failure. The server itself exposes all
-seven tools to any client, so the allowlists are the only separation
-between the specialists.
+including the four Kubernetes MCP tools and the Security tools, and
+that rejection is not swallowed as an ordinary tool failure. The server
+itself exposes all ten tools to any client, so the allowlists are the
+only separation between the specialists.
+
+## Security investigator (`app/supervisor/security.py`)
+
+`make_security_investigator(session_factory)` opens one MCP session per
+investigation and calls exactly three read-only tools in a fixed order:
+`get_failed_auth_attempts` and `get_iam_activity` (both over a 15 minute
+window) and `check_network_exposure` (no window). Failure handling is the
+same as Observability: each call is wrapped separately, and a failed,
+`error` or malformed result becomes an `execution_failed` observation
+that never counts as evidence. An unknown service returns an error from
+the server, never zeros, because missing data must not look like a clean
+result.
+
+The target is resolved exactly as for Observability (`service`, falling
+back to `deployment`, with a `namespace` required). An incident that
+names no workload, such as a leaked key in a repository, a public bucket
+or a root login, returns a `blocked` finding without opening a session.
+
+The investigator reports signals only and never states a cause, an
+intent or a remedy. Thresholds are named constants and inclusive:
+failed authentications 100 per window, access-denied calls 10, credential
+age 90 days, and any exposure flag. For `checkout-api` it says "Failed
+authentication elevated, IAM access-denied calls elevated, publicly
+exposed, ingress open to 0.0.0.0/0." The clean wording is "No elevated
+security signals in the checks run." It never says the service is
+secure, because the absence of a signal in three checks is not a claim of
+safety. Evidence text is built only from validated numbers and booleans,
+so free text returned by a tool never reaches a finding.
+
+| Checks collected | Status | Evidence quality |
+|---|---|---|
+| 3 of 3 | `completed` | `limited` |
+| 1 or 2 of 3 | `partial` | `limited` |
+| 0 of 3 | `failed` | `insufficient` |
+| No namespace or service | `blocked` | `insufficient` |
+
+A `partial` finding is deliberately not usable evidence, for the same
+reason as Observability, and it matters more here: a missing exposure
+check could hide a hole. Security never produces `corroborated` quality
+and never sets `needs_follow_up`.
+
+Architectural rule: only an eligible Kubernetes finding can currently
+support a rollout restart proposal. Security findings can support
+investigation and evidence correlation, but cannot independently
+authorize remediation. There is no Security action type, and a Security
+finding is never listed as supporting a proposal, even beside a
+Kubernetes finding.
+
+The tools are allowlisted in `SECURITY_TOOL_ALLOWLIST`, separate from the
+Kubernetes and Observability allowlists. The Kubernetes allowlist holds
+the agent-facing tool names the adapter builds, not MCP tool names, so
+the boundaries are tested pairwise rather than as a union: Security
+rejects the Observability tools and the two Kubernetes agent tools,
+Observability rejects the Security tools, Kubernetes rejects the Security
+and Observability tools, and no tool is allowed for more than one
+specialist. The partition of the ten server tools into Kubernetes,
+metrics and security groups is tested in `test_mcp_server`.
 
 ## Safety properties
 
@@ -162,8 +237,13 @@ between the specialists.
 | A specialist failure does not crash the incident | `investigate` node | `test_supervisor_graph`, `test_supervisor_kubernetes_integration`, `test_supervisor_stdio_integration` |
 | Failed tool runs never count as evidence | `adapters.is_execution_failure` | `test_platform_state`, `test_supervisor_mcp_tools` |
 | The approval pause survives a process restart | SQLite checkpoint and serde allowlist | `test_platform_lifecycle`, `test_supervisor_graph`, `test_supervisor_stdio_integration` |
-| The agent graph does not overwrite the Supervisor's checkpoint | `compile(checkpointer=False)` | `test_supervisor_kubernetes_integration` (approved path) | Observability agent gets only allowlisted metrics tools | `guard_call_tool` in `observability.py` | `test_supervisor_observability` |
+| The agent graph does not overwrite the Supervisor's checkpoint | `compile(checkpointer=False)` | `test_supervisor_kubernetes_integration` (approved path) |
+| Observability agent gets only allowlisted metrics tools | `guard_call_tool` in `observability.py` | `test_supervisor_observability`, `test_supervisor_kubernetes_integration` (rejects metrics tools) |
 | Observability findings never authorize remediation | `propose_action` filters on the Kubernetes agent | `test_supervisor_observability`, `test_supervisor_stdio_integration` (mixed incident) |
+| Security agent gets only allowlisted security tools | `guard_call_tool` in `security.py` | `test_supervisor_security`, `test_supervisor_kubernetes_integration` (rejects security tools), `test_mcp_server` (tool partition) |
+| Security findings never authorize or support remediation | `propose_action` filters on the Kubernetes agent | `test_supervisor_security` (gate tests), `test_supervisor_stdio_integration` (mixed incident) |
+| Tool output cannot inject text into a Security finding | Evidence built from validated numbers and booleans | `test_supervisor_security` |
+| A missing target is an error or `blocked`, never a clean result | Server returns `error`; `blocked` and `failed` findings | `test_mcp_server`, `test_supervisor_security`, `test_supervisor_stdio_integration` |
 | An incomplete metrics picture is not usable evidence | `is_usable` requires `completed` | `test_supervisor_observability`, `test_supervisor_stdio_integration` (unknown service) |
 | A specialist does not run again on resume | Checkpoint written after the `investigate` node | `test_supervisor_graph`, `test_supervisor_stdio_integration` |
 
@@ -171,9 +251,9 @@ between the specialists.
 
 `test_supervisor_routing`, `test_routing_eval`,
 `test_supervisor_components`, `test_supervisor_graph`,
-`test_supervisor_kubernetes_integration`, `test_supervisor_mcp_tools` and
-`test_supervisor_observability` and `test_supervisor_stdio_integration`,
-all under `app/`.
+`test_supervisor_kubernetes_integration`, `test_supervisor_mcp_tools`, `test_supervisor_observability`,
+`test_supervisor_security`, `test_mcp_server` and
+`test_supervisor_stdio_integration`, all under `app/`.
 
 ## Running
 
@@ -189,15 +269,22 @@ all under `app/`.
 
 ## Known limitations
 
-- Only the Kubernetes and Observability specialists have investigators.
-  Incidents routed to Security produce a `blocked` finding ("no
-  investigator registered").
+- Only the Kubernetes, Observability and Security specialists have
+  investigators. A specialist with no registered investigator produces a
+  `blocked` finding ("no investigator registered").
+- Security needs a workload. An incident with no namespace and service,
+  such as a leaked key in a repository, a public bucket or a root login,
+  is routed to Security but produces a `blocked` finding. A field for
+  other resources (a repository, bucket or account) would be needed to
+  investigate those.
 - `build_supervisor_graph` is called only from tests: no production entry
   point builds the investigators mapping yet. That arrives with the
   FastAPI phase.
-- There is no evidence correlation yet. Observability and Kubernetes
-  findings about the same workload are reported side by side, and
-  `Finding.contradicts` and `corroborated` quality are unused.
+- There is no evidence correlation yet. Kubernetes, Observability and
+  Security findings about the same workload are reported side by side,
+  and `Finding.contradicts` and `corroborated` quality are unused. A
+  Security finding that disagrees with a Kubernetes finding neither
+  blocks nor supports a proposal, and nothing yet reconciles them.
 - Only a crash loop produces a proposal. Other failure types (image pull
   errors, OOM kills) investigate but propose nothing.
 - Deployment name: the MCP adapter passes the pod name as the deployment
@@ -223,7 +310,8 @@ all under `app/`.
 1. Add an adapter from its response contract to `Finding` in
    `app/state/adapters.py`.
 2. Add an investigator (as in `app/supervisor/investigators.py`) and,
-   if it is async, a bridge with its own tool allowlist.
+   if it is async, a bridge with its own tool allowlist. An MCP-backed
+   specialist can reuse `app/supervisor/specialist_common.py`.
 3. Register it in the investigators mapping passed to
    `build_supervisor_graph`.
 4. Extend the signal rules and the routing eval set, and re-run the
