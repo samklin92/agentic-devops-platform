@@ -546,3 +546,142 @@ def test_security_with_observability_and_no_kubernetes_finding_proposes_nothing(
     ]
     assert propose_action(crash_loop_incident(), findings) is None
 
+
+# --- structured signals --------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "kwargs, expected",
+    [
+        ({}, []),
+        ({"failed_auth": 100}, ["failed_auth_elevated"]),
+        ({"failed_auth": 99}, []),
+        ({"denied": 10}, ["iam_denied_elevated"]),
+        ({"denied": 9}, []),
+        ({"age": 90}, ["credential_stale"]),
+        ({"age": 89}, []),
+        ({"exposed": True}, ["publicly_exposed"]),
+        ({"open_ingress": True}, ["open_ingress"]),
+        (
+            {
+                "failed_auth": 500,
+                "denied": 50,
+                "age": 200,
+                "exposed": True,
+                "open_ingress": True,
+            },
+            [
+                "failed_auth_elevated",
+                "iam_denied_elevated",
+                "credential_stale",
+                "publicly_exposed",
+                "open_ingress",
+            ],
+        ),
+    ],
+)
+def test_signals_follow_the_inclusive_thresholds(kwargs, expected):
+    assert collect(fixed_backend(**kwargs)).signals == expected
+
+
+@pytest.mark.parametrize(
+    "service, expected",
+    [
+        ("payment-api", ["credential_stale"]),
+        ("inventory-api", []),
+        (
+            "checkout-api",
+            [
+                "failed_auth_elevated",
+                "iam_denied_elevated",
+                "publicly_exposed",
+                "open_ingress",
+            ],
+        ),
+    ],
+)
+def test_simulated_services_carry_the_expected_signals(service, expected):
+    assert collect(server_backend(), service=service).signals == expected
+
+
+_OWNED_SIGNALS = {
+    sec.TOOL_FAILED_AUTH: {"failed_auth_elevated"},
+    sec.TOOL_IAM: {"iam_denied_elevated", "credential_stale"},
+    sec.TOOL_EXPOSURE: {"publicly_exposed", "open_ingress"},
+}
+
+
+@pytest.mark.parametrize("tool", sorted(_OWNED_SIGNALS))
+def test_a_failed_check_never_produces_its_signals(tool):
+    finding = collect(
+        fixed_backend(
+            failed_auth=500,
+            denied=50,
+            age=200,
+            exposed=True,
+            open_ingress=True,
+            raises={tool},
+        )
+    )
+    assert finding.status == "partial"
+    assert not _OWNED_SIGNALS[tool] & set(finding.signals)
+    others = set().union(*(v for k, v in _OWNED_SIGNALS.items() if k != tool))
+    assert others <= set(finding.signals)
+
+
+def test_all_checks_failing_carries_no_signals():
+    finding = collect(fixed_backend(exposed=True, raises=set(sec._SEQUENCE)))
+    assert finding.status == "failed"
+    assert finding.signals == []
+
+
+def test_malformed_check_results_carry_no_signals():
+    async def call_tool(name, arguments):
+        if name == sec.TOOL_EXPOSURE:
+            return {"publicly_exposed": 1, "open_ingress_cidr": "yes"}
+        return {"failed_auth_count": "500", "access_denied_calls": True}
+
+    finding = collect(call_tool)
+    assert finding.status == "failed"
+    assert finding.signals == []
+
+
+def test_unknown_service_and_blocked_findings_carry_no_signals():
+    assert collect(server_backend(), service="ghost").signals == []
+    blocked = sec.make_security_investigator(factory_for(FakeSession()))(
+        make_incident(namespace=None)
+    )
+    assert blocked.status == "blocked"
+    assert blocked.signals == []
+
+
+def test_signals_and_summary_always_agree():
+    import itertools
+
+    tools = sorted(sec._SEQUENCE)
+    failure_sets = [
+        set(subset)
+        for size in range(len(tools) + 1)
+        for subset in itertools.combinations(tools, size)
+    ]
+    for auth, denied, age, exposed in itertools.product(
+        (0, 500), (0, 50), (10, 200), (False, True)
+    ):
+        for raises in failure_sets:
+            finding = collect(
+                fixed_backend(
+                    failed_auth=auth,
+                    denied=denied,
+                    age=age,
+                    exposed=exposed,
+                    open_ingress=exposed,
+                    raises=raises,
+                )
+            )
+            summary = finding.summary.lower()
+            named = {
+                signal
+                for signal, text in sec._SIGNAL_TEXT.items()
+                if text.lower() in summary
+            }
+            assert set(finding.signals) == named

@@ -145,34 +145,54 @@ def _observation(result: CheckResult) -> str:
     )
 
 
-def _describe(results: list[CheckResult]) -> str:
-    """Name the signals present in the checks that were collected."""
+_SIGNAL_TEXT = {
+    "failed_auth_elevated": "failed authentication elevated",
+    "iam_denied_elevated": "IAM access-denied calls elevated",
+    "credential_stale": (
+        f"credential age at or above {CREDENTIAL_AGE_STALE_DAYS} days"
+    ),
+    "publicly_exposed": "publicly exposed",
+    "open_ingress": "ingress open to 0.0.0.0/0",
+}
+
+
+def _signals(results: list[CheckResult]) -> list[str]:
+    """Signals from the checks that were collected successfully.
+
+    A failed or malformed check produces no signal, and its absence is
+    never read as a clean result.
+    """
     data = {r.tool: r.data for r in results if r.ok}
     signals: list[str] = []
 
     auth = data.get(TOOL_FAILED_AUTH)
     if auth is not None and auth["failed_auth_count"] >= FAILED_AUTH_ELEVATED:
-        signals.append("failed authentication elevated")
+        signals.append("failed_auth_elevated")
 
     iam = data.get(TOOL_IAM)
     if iam is not None:
         if iam["access_denied_calls"] >= ACCESS_DENIED_ELEVATED:
-            signals.append("IAM access-denied calls elevated")
+            signals.append("iam_denied_elevated")
         if iam["credential_age_days"] >= CREDENTIAL_AGE_STALE_DAYS:
-            signals.append(
-                f"credential age at or above {CREDENTIAL_AGE_STALE_DAYS} days"
-            )
+            signals.append("credential_stale")
 
     exposure = data.get(TOOL_EXPOSURE)
     if exposure is not None:
         if exposure["publicly_exposed"]:
-            signals.append("publicly exposed")
+            signals.append("publicly_exposed")
         if exposure["open_ingress_cidr"]:
-            signals.append("ingress open to 0.0.0.0/0")
+            signals.append("open_ingress")
+    return signals
+
+
+def _describe(results: list[CheckResult]) -> str:
+    """Name the signals present in the checks that were collected."""
+    collected = {r.tool for r in results if r.ok}
+    signals = [_SIGNAL_TEXT[signal] for signal in _signals(results)]
 
     if signals:
         text = ", ".join(signals)
-    elif len(data) == len(_SEQUENCE):
+    elif len(collected) == len(_SEQUENCE):
         text = "no elevated security signals in the checks run"
     else:
         text = "no elevated security signals in the checks that were collected"
@@ -211,6 +231,7 @@ def finding_from_checks(results: list[CheckResult]) -> Finding:
             for r in results
         ],
         evidence_quality=quality,
+        signals=_signals(results),
         error_message=error_message,
     )
 

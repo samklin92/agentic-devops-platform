@@ -130,35 +130,56 @@ def _observation(result: MetricResult) -> str:
     )
 
 
-def _describe(results: list[MetricResult]) -> str:
-    """Name the symptoms present in the metrics that were collected."""
+_SIGNAL_TEXT = {
+    "errors_elevated": "errors elevated",
+    "latency_elevated": "latency elevated",
+    "cpu_saturated": "CPU saturated",
+    "memory_near_limit": "memory near limit",
+}
+_RESOURCE_SIGNALS = frozenset({"cpu_saturated", "memory_near_limit"})
+
+
+def _signals(results: list[MetricResult]) -> list[str]:
+    """Signals from the metrics that were collected successfully.
+
+    A failed or malformed metric produces no signal, and its absence is
+    never read as a normal value.
+    """
     data = {r.tool: r.data for r in results if r.ok}
-    abnormal: list[str] = []
+    signals: list[str] = []
 
     errors = data.get(TOOL_ERROR_RATE)
     if errors is not None and errors["error_rate_pct"] >= ERROR_RATE_ELEVATED_PCT:
-        abnormal.append("errors elevated")
+        signals.append("errors_elevated")
 
     latency = data.get(TOOL_LATENCY)
     if latency is not None and latency["p95_ms"] >= P95_ELEVATED_MS:
-        abnormal.append("latency elevated")
+        signals.append("latency_elevated")
 
     resources = data.get(TOOL_RESOURCES)
-    resource_flags: list[str] = []
     if resources is not None:
         if resources["cpu_pct_of_limit"] >= CPU_SATURATED_PCT:
-            resource_flags.append("CPU saturated")
+            signals.append("cpu_saturated")
         if resources["memory_pct_of_limit"] >= MEMORY_NEAR_LIMIT_PCT:
-            resource_flags.append("memory near limit")
-    abnormal.extend(resource_flags)
+            signals.append("memory_near_limit")
+    return signals
 
-    parts = list(abnormal)
-    if resources is not None and not resource_flags and abnormal:
+
+def _describe(results: list[MetricResult]) -> str:
+    """Name the symptoms present in the metrics that were collected."""
+    collected = {r.tool for r in results if r.ok}
+    signals = _signals(results)
+
+    parts = [_SIGNAL_TEXT[signal] for signal in signals]
+    resources_normal = (
+        TOOL_RESOURCES in collected and not _RESOURCE_SIGNALS & set(signals)
+    )
+    if resources_normal and parts:
         parts.append("resources normal")
 
     if parts:
         text = ", ".join(parts)
-    elif len(data) == len(_SEQUENCE):
+    elif len(collected) == len(_SEQUENCE):
         text = "metrics within normal thresholds"
     else:
         text = "no elevated symptoms in the metrics that were collected"
@@ -195,6 +216,7 @@ def finding_from_metrics(results: list[MetricResult]) -> Finding:
             for r in results
         ],
         evidence_quality=quality,
+        signals=_signals(results),
         error_message=error_message,
     )
 

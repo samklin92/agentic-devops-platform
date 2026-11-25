@@ -360,3 +360,125 @@ def test_mixed_findings_are_supported_only_by_the_kubernetes_finding():
     assert action is not None
     assert action.action_type == "rollout_restart"
     assert action.supporting_finding_ids == [kubernetes.finding_id]
+
+
+# --- structured signals --------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "kwargs, expected",
+    [
+        ({}, []),
+        ({"error_rate_pct": 5.0}, ["errors_elevated"]),
+        ({"error_rate_pct": 4.9}, []),
+        ({"p95_ms": 1000}, ["latency_elevated"]),
+        ({"p95_ms": 999}, []),
+        ({"cpu": 90}, ["cpu_saturated"]),
+        ({"cpu": 89}, []),
+        ({"memory": 90}, ["memory_near_limit"]),
+        ({"memory": 89}, []),
+        (
+            {"error_rate_pct": 9, "p95_ms": 2000, "cpu": 95, "memory": 95},
+            [
+                "errors_elevated",
+                "latency_elevated",
+                "cpu_saturated",
+                "memory_near_limit",
+            ],
+        ),
+    ],
+)
+def test_signals_follow_the_inclusive_thresholds(kwargs, expected):
+    assert collect(fixed_backend(**kwargs)).signals == expected
+
+
+@pytest.mark.parametrize(
+    "service, expected",
+    [
+        ("payment-api", []),
+        ("inventory-api", ["errors_elevated", "latency_elevated"]),
+        ("checkout-api", ["latency_elevated", "cpu_saturated"]),
+    ],
+)
+def test_simulated_services_carry_the_expected_signals(service, expected):
+    assert collect(server_backend(), service=service).signals == expected
+
+
+_OWNED_SIGNALS = {
+    obs.TOOL_ERROR_RATE: {"errors_elevated"},
+    obs.TOOL_LATENCY: {"latency_elevated"},
+    obs.TOOL_RESOURCES: {"cpu_saturated", "memory_near_limit"},
+}
+
+
+@pytest.mark.parametrize("tool", sorted(_OWNED_SIGNALS))
+def test_a_failed_metric_call_never_produces_its_signals(tool):
+    finding = collect(
+        fixed_backend(
+            error_rate_pct=50, p95_ms=5000, cpu=99, memory=99, raises={tool}
+        )
+    )
+    assert finding.status == "partial"
+    assert not _OWNED_SIGNALS[tool] & set(finding.signals)
+    # The metrics that did succeed still report their own signals.
+    others = set().union(
+        *(v for k, v in _OWNED_SIGNALS.items() if k != tool)
+    )
+    assert others <= set(finding.signals)
+
+
+def test_all_calls_failing_carries_no_signals():
+    finding = collect(
+        fixed_backend(error_rate_pct=50, raises=set(obs._SEQUENCE))
+    )
+    assert finding.status == "failed"
+    assert finding.signals == []
+
+
+def test_malformed_metric_results_carry_no_signals():
+    async def call_tool(name, arguments):
+        return {"error_rate_pct": "50", "p95_ms": True, "cpu_pct_of_limit": None}
+
+    finding = collect(call_tool)
+    assert finding.status == "failed"
+    assert finding.signals == []
+
+
+def test_unknown_service_and_blocked_findings_carry_no_signals():
+    assert collect(server_backend(), service="ghost").signals == []
+    blocked = obs.make_observability_investigator(factory_for(FakeSession()))(
+        make_incident(namespace=None)
+    )
+    assert blocked.status == "blocked"
+    assert blocked.signals == []
+
+
+def test_signals_and_summary_always_agree():
+    import itertools
+
+    tools = sorted(obs._SEQUENCE)
+    failure_sets = [
+        set(subset)
+        for size in range(len(tools) + 1)
+        for subset in itertools.combinations(tools, size)
+    ]
+    for error, p95, cpu, memory in itertools.product(
+        (0.1, 9), (100, 2000), (10, 95), (10, 95)
+    ):
+        for raises in failure_sets:
+            finding = collect(
+                fixed_backend(
+                    error_rate_pct=error,
+                    p95_ms=p95,
+                    cpu=cpu,
+                    memory=memory,
+                    raises=raises,
+                )
+            )
+            summary = finding.summary.lower()
+            named = {
+                signal
+                for signal, text in obs._SIGNAL_TEXT.items()
+                if text.lower() in summary
+            }
+            assert set(finding.signals) == named

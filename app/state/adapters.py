@@ -4,6 +4,7 @@ import json
 
 from app.contracts.agent_messages import KubernetesInvestigationResponse
 from app.state.models import Finding
+from app.state.signals import mentions_crash_loop
 
 MAX_SUMMARY_CHARS = 500
 
@@ -40,6 +41,18 @@ def finding_from_kubernetes_response(
     ]
     quality = response.evidence_quality if diagnostic else "insufficient"
 
+    # A signal needs a successful diagnostic behind it. Error messages and
+    # failed tool runs never produce one, and neither does a failed or
+    # blocked finding.
+    signals = []
+    if diagnostic and response.status not in ("failed", "blocked"):
+        signal_text = " ".join(
+            [summary if response.findings else ""]
+            + [item.observation for item in diagnostic]
+        )
+        if mentions_crash_loop(signal_text):
+            signals.append("crash_loop")
+
     return Finding(
         agent_name="kubernetes",
         summary=summary,
@@ -47,5 +60,6 @@ def finding_from_kubernetes_response(
         evidence=list(response.evidence),
         evidence_quality=quality,
         needs_follow_up=response.needs_follow_up,
+        signals=signals,
         error_message=response.error_message,
     )

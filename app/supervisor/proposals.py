@@ -1,15 +1,13 @@
 """Deterministic remediation proposals. Proposal only, never execution."""
 
-import re
-
 from app.state.models import (
     Finding,
     IncidentContext,
     ProposedAction,
     RiskLevel,
 )
+from app.state.signals import CRASH_LOOP_PATTERN as _CRASH_LOOP
 
-_CRASH_LOOP = re.compile(r"\bcrash[\s-]?loop", re.IGNORECASE)
 _PRODUCTION = {"production", "prod"}
 
 
