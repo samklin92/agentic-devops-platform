@@ -1,14 +1,17 @@
 import sqlite3
+from typing import TypedDict, get_type_hints
 
 import pytest
 from langgraph.checkpoint.sqlite import SqliteSaver
-from langgraph.types import Command
+from langgraph.graph import START, StateGraph
+from langgraph.types import Command, interrupt
 
 from app.contracts.agent_messages import AgentEvidence
-from app.state.graph_state import new_platform_state
-from app.state.models import CallLimits, Finding, IncidentContext
+from app.state.graph_state import PlatformState, new_platform_state
+from app.state.models import CallLimits, Correlation, Finding, IncidentContext
 from app.state.serde import platform_serializer
 from app.supervisor.graph import build_supervisor_graph
+from app.supervisor.routing import route_incident
 
 CONFIG = {"configurable": {"thread_id": "inc-001"}}
 
@@ -115,7 +118,8 @@ def test_approved_incident_runs_end_to_end(db_path):
     assert final["report"].outcome == "action_executed_simulated"
     assert final["status"] == "completed"
     assert final["agent_call_counts"] == {"kubernetes": 1}
-    assert final["supervisor_hops"] == 4
+    # receive_alert, route, correlate, evaluate and report each count once.
+    assert final["supervisor_hops"] == 5
     assert events(final) == [
         "alert_received",
         "routed",
@@ -252,3 +256,268 @@ def test_multi_specialist_incident_continues_when_one_is_unavailable(db_path):
     assert {f.agent_name: f.status for f in findings}["security"] == "blocked"
     assert snapshot.next == ("approval",)
     assert snapshot.values["proposed_action"] is not None
+
+
+# --- correlation ---------------------------------------------------------
+
+CORROBORATED_INCIDENT = (
+    "Pod inventory-api-7d9f is in CrashLoopBackOff with elevated error rate"
+)
+
+
+def signalled(agent, *signals, summary=None, status="completed") -> Finding:
+    return Finding(
+        agent_name=agent,
+        summary=summary or f"{agent} finding",
+        status=status,
+        evidence=[AgentEvidence(source_tool="some_tool", observation="ok")],
+        evidence_quality="limited",
+        signals=list(signals),
+    )
+
+
+def kubernetes_crash() -> Finding:
+    return Finding(
+        agent_name="kubernetes",
+        summary="Pod is in CrashLoopBackOff",
+        evidence=[
+            AgentEvidence(
+                source_tool="get_pod_status", observation="CrashLoopBackOff"
+            )
+        ],
+        evidence_quality="limited",
+        signals=["crash_loop"],
+    )
+
+
+def crash_loop_proposal(finding: Finding):
+    from app.supervisor.proposals import propose_action
+
+    return propose_action(make_incident(), [finding])
+
+
+def pause_payload(snapshot) -> dict:
+    return snapshot.tasks[0].interrupts[0].value
+
+
+def test_corroboration_is_recorded_without_changing_the_proposal(db_path, tmp_path):
+    kubernetes = kubernetes_crash()
+    observability = signalled("observability", "errors_elevated")
+    incident = make_incident(description=CORROBORATED_INCIDENT)
+
+    _, snapshot = run(
+        db_path,
+        {
+            "kubernetes": FakeInvestigator(kubernetes),
+            "observability": FakeInvestigator(observability),
+        },
+        new_platform_state(incident),
+    )
+
+    (correlation,) = snapshot.values["correlations"]
+    assert correlation.kind == "corroborates"
+    assert correlation.finding_ids == [
+        kubernetes.finding_id,
+        observability.finding_id,
+    ]
+    action = snapshot.values["proposed_action"]
+    assert action.supporting_finding_ids == [kubernetes.finding_id]
+    assert "Evidence relationships" in action.rationale
+    payload = pause_payload(snapshot)
+    assert payload["correlations"] == [
+        {
+            "kind": "corroborates",
+            "rule": "shared_incident_impact",
+            "finding_ids": correlation.finding_ids,
+            "explanation": correlation.explanation,
+        }
+    ]
+    assert payload["rationale"] == action.rationale
+
+    # Control: the same Kubernetes finding with no Observability finding.
+    control_db = str(tmp_path / "control.sqlite")
+    _, control = run(
+        control_db,
+        {"kubernetes": FakeInvestigator(kubernetes)},
+        new_platform_state(incident),
+    )
+    assert control.values["correlations"] == []
+    baseline = control.values["proposed_action"]
+    for field in (
+        "action_type",
+        "namespace",
+        "target",
+        "risk_level",
+        "supporting_finding_ids",
+    ):
+        assert getattr(action, field) == getattr(baseline, field)
+    assert "Evidence relationships" not in baseline.rationale
+
+    final = resume(
+        db_path,
+        {
+            "kubernetes": FakeInvestigator(kubernetes),
+            "observability": FakeInvestigator(observability),
+        },
+        {"approved": True, "decided_by": "samklin"},
+    )
+    assert final["report"].outcome == "action_executed_simulated"
+    assert (
+        "Evidence relationships: corroborates "
+        "(kubernetes + observability, shared_incident_impact)."
+    ) in final["report"].summary
+    assert final["supervisor_hops"] == 5
+    assert final["agent_call_counts"] == {"kubernetes": 1, "observability": 1}
+    names = events(final)
+    assert names.index("observability_investigated") < names.index(
+        "correlation_recorded"
+    ) < names.index("action_proposed")
+
+
+def test_a_contradiction_is_shown_but_does_not_block_the_proposal(db_path):
+    kubernetes = kubernetes_crash()
+    clean = signalled("observability", summary="Metrics within normal thresholds.")
+    incident = make_incident(description=CORROBORATED_INCIDENT)
+
+    _, snapshot = run(
+        db_path,
+        {
+            "kubernetes": FakeInvestigator(kubernetes),
+            "observability": FakeInvestigator(clean),
+        },
+        new_platform_state(incident),
+    )
+
+    (correlation,) = snapshot.values["correlations"]
+    assert correlation.kind == "contradicts"
+    assert snapshot.next == ("approval",)
+    action = snapshot.values["proposed_action"]
+    assert action.supporting_finding_ids == [kubernetes.finding_id]
+    assert "contradicts (kubernetes + observability" in action.rationale
+    assert pause_payload(snapshot)["correlations"][0]["kind"] == "contradicts"
+
+
+def test_co_occurrence_alone_never_proposes_or_pauses(db_path):
+    incident = make_incident(
+        description="Failed logins and CPU saturation on checkout-api",
+        namespace="production",
+        pod_name=None,
+        deployment=None,
+        service="checkout-api",
+    )
+    result, snapshot = run(
+        db_path,
+        {
+            "observability": FakeInvestigator(
+                signalled("observability", "cpu_saturated")
+            ),
+            "security": FakeInvestigator(
+                signalled("security", "failed_auth_elevated")
+            ),
+        },
+        new_platform_state(incident),
+    )
+
+    assert snapshot.next == ()
+    (correlation,) = result["correlations"]
+    assert correlation.kind == "co_occurs"
+    assert result["proposed_action"] is None
+    assert result["approval"] is None
+    assert result["execution"] is None
+    assert result["report"].outcome == "no_action_proposed"
+    assert (
+        "co occurs (observability + security, load_with_failed_auth)"
+        in result["report"].summary
+    )
+    assert "correlation_recorded" in events(result)
+
+
+def test_stale_correlations_are_replaced_not_accumulated(db_path):
+    stale = Correlation(
+        kind="corroborates",
+        rule="shared_incident_impact",
+        finding_ids=["stale-1", "stale-2"],
+        explanation="Left over from an earlier investigation.",
+    )
+    state = new_platform_state(make_incident())
+    state["correlations"] = [stale]
+    healthy = Finding(
+        agent_name="kubernetes",
+        summary="Pod is Running",
+        evidence=[
+            AgentEvidence(source_tool="get_pod_status", observation="Running")
+        ],
+        evidence_quality="limited",
+    )
+
+    result, _ = run(
+        db_path, {"kubernetes": FakeInvestigator(healthy)}, state
+    )
+
+    assert result["correlations"] == []
+    assert "correlation_recorded" not in events(result)
+
+
+def test_no_correlation_step_when_no_specialist_applies(db_path):
+    incident = make_incident(
+        description="Failed deployment pipeline on the main branch",
+        namespace=None,
+        pod_name=None,
+        deployment=None,
+    )
+    result, _ = run(db_path, {}, new_platform_state(incident))
+    assert result["correlations"] == []
+    assert result["supervisor_hops"] == 3  # receive_alert, route, report
+
+
+def test_state_without_the_correlations_key_still_runs(db_path):
+    state = new_platform_state(make_incident())
+    del state["correlations"]
+    investigator = FakeInvestigator(crash_loop_finding())
+
+    _, snapshot = run(db_path, {"kubernetes": investigator}, state)
+
+    assert snapshot.next == ("approval",)
+    assert snapshot.values["correlations"] == []
+
+
+def test_resume_from_a_checkpoint_written_before_correlations_existed(db_path):
+    # A checkpoint paused at approval, written by a version of the state
+    # that had no `correlations` field. The current graph must resume it.
+    hints = get_type_hints(PlatformState, include_extras=True)
+    legacy_hints = {k: v for k, v in hints.items() if k != "correlations"}
+    LegacyState = TypedDict("LegacyState", legacy_hints)
+
+    finding = crash_loop_finding()
+    action = crash_loop_proposal(finding)
+
+    def legacy_approval(state):
+        interrupt({"action_id": state["proposed_action"].action_id})
+        return {}
+
+    legacy = StateGraph(LegacyState)
+    legacy.add_node("approval", legacy_approval)
+    legacy.add_edge(START, "approval")
+
+    state = new_platform_state(make_incident())
+    del state["correlations"]
+    state["routing"] = route_incident(make_incident())
+    state["findings"] = [finding]
+    state["proposed_action"] = action
+    state["status"] = "awaiting_approval"
+
+    saver, connection = open_saver(db_path)
+    try:
+        legacy.compile(checkpointer=saver).invoke(state, CONFIG)
+    finally:
+        connection.close()
+
+    final = resume(
+        db_path,
+        {"kubernetes": FakeInvestigator(finding)},
+        {"approved": True, "decided_by": "samklin"},
+    )
+
+    assert final["approval"].status == "approved"
+    assert final["report"].outcome == "action_executed_simulated"
+    assert "Evidence relationships" not in final["report"].summary

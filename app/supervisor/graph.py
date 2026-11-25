@@ -1,4 +1,12 @@
-"""The Supervisor graph: routing, investigation, approval and reporting."""
+"""The Supervisor graph: routing, investigation, correlation, approval and
+reporting.
+
+Flow: receive_alert, route, investigate, correlate, evaluate, then
+approval, execute and report. Correlation is a Supervisor step. It records
+how findings relate and never decides, changes or authorizes an action:
+the proposal gate (`propose_action`) alone decides eligibility, and a
+human approves.
+"""
 
 from collections.abc import Mapping
 from typing import Any
@@ -10,11 +18,14 @@ from app.state.graph_state import PlatformState, check_call_budget
 from app.state.models import (
     ApprovalRecord,
     AuditEntry,
+    Correlation,
     ExecutionRecord,
     Finding,
     IncidentReport,
     SpecialistName,
 )
+from app.supervisor.correlation import annotate_action
+from app.supervisor.correlation import correlate as compute_correlations
 from app.supervisor.investigators import Investigator
 from app.supervisor.proposals import is_usable, propose_action
 from app.supervisor.routing import route_incident
@@ -54,6 +65,35 @@ def _blocked_finding(agent: SpecialistName, reason: str) -> Finding:
         status="blocked",
         error_message=reason,
     )
+
+
+def current_correlations(state: PlatformState) -> list[Correlation]:
+    """The correlations in state.
+
+    Tolerates a checkpoint written before the field existed, which simply
+    has none.
+    """
+    return state.get("correlations") or []
+
+
+def _relation_label(
+    correlation: Correlation, findings: list[Finding]
+) -> str:
+    agent_of = {f.finding_id: f.agent_name for f in findings}
+    agents = " + ".join(
+        agent_of.get(finding_id, "unknown")
+        for finding_id in correlation.finding_ids
+    )
+    return f"{correlation.kind.replace('_', ' ')} ({agents}, {correlation.rule})"
+
+
+def _correlation_clause(
+    correlations: list[Correlation], findings: list[Finding]
+) -> str:
+    if not correlations:
+        return ""
+    labels = "; ".join(_relation_label(c, findings) for c in correlations)
+    return f" Evidence relationships: {labels}."
 
 
 def _digest(findings: list[Finding]) -> str:
@@ -141,8 +181,32 @@ def build_supervisor_graph(
             "audit_log": entries,
         }
 
+    def correlate(state: PlatformState) -> dict:
+        # Recomputed from the current findings every time, never
+        # accumulated, so a repeated investigation leaves nothing stale.
+        findings = state["findings"]
+        correlations = compute_correlations(findings)
+        return {
+            "correlations": correlations,
+            "supervisor_hops": 1,
+            "audit_log": [
+                audit(
+                    state,
+                    "supervisor",
+                    "correlation_recorded",
+                    _relation_label(c, findings),
+                )
+                for c in correlations
+            ],
+        }
+
     def evaluate(state: PlatformState) -> dict:
-        action = propose_action(state["incident"], state["findings"])
+        # The gate decides on the findings alone. Correlations may only
+        # add explanatory text to a proposal that already exists.
+        proposed = propose_action(state["incident"], state["findings"])
+        action = annotate_action(
+            proposed, current_correlations(state), state["findings"]
+        )
         if action is None:
             usable = any(is_usable(f) for f in state["findings"])
             detail = (
@@ -176,6 +240,15 @@ def build_supervisor_graph(
             "target": action.target,
             "risk_level": action.risk_level,
             "rationale": action.rationale,
+            "correlations": [
+                {
+                    "kind": c.kind,
+                    "rule": c.rule,
+                    "finding_ids": list(c.finding_ids),
+                    "explanation": c.explanation,
+                }
+                for c in current_correlations(state)
+            ],
         })
         approved, decided_by, reason = parse_decision(raw)
         record = ApprovalRecord(
@@ -212,6 +285,7 @@ def build_supervisor_graph(
         findings = state["findings"]
         action = state["proposed_action"]
         approval_record = state["approval"]
+        clause = _correlation_clause(current_correlations(state), findings)
 
         if state["routing"] is None:
             outcome = "no_action_proposed"
@@ -221,15 +295,21 @@ def build_supervisor_graph(
             )
         elif state["execution"] is not None:
             outcome = "action_executed_simulated"
-            summary = f"{state['execution'].message} Findings: {_digest(findings)}"
+            summary = (
+                f"{state['execution'].message} "
+                f"Findings: {_digest(findings)}{clause}"
+            )
         elif approval_record is not None and approval_record.status == "rejected":
             outcome = "action_rejected"
-            summary = f"Proposed action was rejected. Findings: {_digest(findings)}"
+            summary = (
+                "Proposed action was rejected. "
+                f"Findings: {_digest(findings)}{clause}"
+            )
         elif action is None and any(is_usable(f) for f in findings):
             outcome = "no_action_proposed"
             summary = (
                 "Evidence gathered but no automated remediation applies. "
-                f"Findings: {_digest(findings)}"
+                f"Findings: {_digest(findings)}{clause}"
             )
         else:
             outcome = "investigation_failed"
@@ -258,6 +338,7 @@ def build_supervisor_graph(
         ("receive_alert", receive_alert),
         ("route", route),
         ("investigate", investigate),
+        ("correlate", correlate),
         ("evaluate", evaluate),
         ("approval", approval),
         ("execute", execute),
@@ -270,7 +351,8 @@ def build_supervisor_graph(
     builder.add_conditional_edges(
         "route", after_route, {"investigate": "investigate", "report": "report"}
     )
-    builder.add_edge("investigate", "evaluate")
+    builder.add_edge("investigate", "correlate")
+    builder.add_edge("correlate", "evaluate")
     builder.add_conditional_edges(
         "evaluate", after_evaluate, {"approval": "approval", "report": "report"}
     )

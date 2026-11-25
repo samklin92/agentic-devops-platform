@@ -433,3 +433,58 @@ def test_security_session_failure_is_contained(db_path):
     assert "security_failed" in [e.event for e in result["audit_log"]]
     assert result["proposed_action"] is None
     assert result["report"].outcome == "investigation_failed"
+
+
+def test_mixed_incident_records_a_corroboration_over_stdio(db_path):
+    incident = make_incident(
+        description=(
+            "inventory-api is in CrashLoopBackOff with failed logins "
+            "and elevated error rate"
+        ),
+        service="inventory-api",
+    )
+
+    _, snapshot = run(
+        db_path,
+        all_stdio_investigators([]),
+        new_platform_state(incident),
+    )
+
+    assert snapshot.next == ("approval",), describe(snapshot)
+    by_agent = {f.agent_name: f for f in snapshot.values["findings"]}
+    assert by_agent["kubernetes"].signals == ["crash_loop"]
+    assert by_agent["observability"].signals == [
+        "errors_elevated",
+        "latency_elevated",
+    ]
+    assert by_agent["security"].signals == []
+    (correlation,) = snapshot.values["correlations"]
+    assert correlation.kind == "corroborates"
+    assert correlation.finding_ids == [
+        by_agent["kubernetes"].finding_id,
+        by_agent["observability"].finding_id,
+    ]
+    action = snapshot.values["proposed_action"]
+    assert action.supporting_finding_ids == [by_agent["kubernetes"].finding_id]
+    assert "Evidence relationships" in action.rationale
+
+
+def test_load_with_failed_auth_is_recorded_but_never_proposes(db_path):
+    incident = make_security_incident(
+        description="Failed logins and CPU saturation on checkout-api",
+    )
+
+    result, snapshot = run(
+        db_path,
+        all_stdio_investigators([]),
+        new_platform_state(incident),
+    )
+
+    assert snapshot.next == (), describe(snapshot)
+    (correlation,) = result["correlations"]
+    assert correlation.kind == "co_occurs"
+    assert correlation.rule == "load_with_failed_auth"
+    assert "does not establish causation" in correlation.explanation
+    assert result["proposed_action"] is None
+    assert result["report"].outcome == "no_action_proposed"
+    assert "co occurs (observability + security" in result["report"].summary
