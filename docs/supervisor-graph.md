@@ -36,12 +36,21 @@ Kubernetes signal. No match returns `None`, and the incident is
 escalated to a human in the report. Every decision lists the signals
 that fired.
 
-Measured by `python -m app.evaluate_routing` on 28 labelled incidents
+Measured by `python -m app.evaluate_routing` on 35 labelled incidents
 (`evals/routing_questions.json`). At the time of writing the baseline
-gets 26 of 28 exactly right, with precision 1.00 for every specialist.
-The two misses are deliberately keyword-free cases marked `hard` (an exit
-code 137 restart loop and a vague customer-impact report). They mark the
-limit of rules and the bar an LLM router would have to beat.
+gets 33 of 35 exactly right, with precision 1.00 for every specialist
+and recall 0.93 for Kubernetes and Observability. The two misses are
+deliberately keyword-free cases marked `hard` (an exit code 137 restart
+loop and a vague customer-impact report). They mark the limit of rules
+and the bar an LLM router would have to beat. The set was extended when
+the Observability specialist was added (mixed crash-loop and HTTP 500
+cases, metrics-only cases, and a pod with no metrics signal that must
+not route to Observability), and Kubernetes precision did not change.
+
+`memory pressure` routes to Observability, as a resource metric. The
+Kubernetes node condition `MemoryPressure` is a different thing: written
+as one word it does not match, and a pod or other Kubernetes signal in
+the same description still routes to Kubernetes.
 
 ## Evidence gate and proposals (`app/supervisor/proposals.py`)
 
@@ -94,6 +103,53 @@ stdio for each investigation, with a 20 second timeout on
 started with `sys.executable`, never a bare `python`. A server that
 cannot start becomes a failed finding.
 
+## Observability investigator (`app/supervisor/observability.py`)
+
+`make_observability_investigator(session_factory)` opens one MCP session
+per investigation and calls exactly three read-only tools in a fixed
+order: `get_error_rate`, `get_latency_percentiles` and
+`get_resource_usage`, over a fixed window. Each call is wrapped
+separately, so one failure never stops the other two. A failed call, an
+`error` result or a malformed result is recorded as an `execution_failed`
+observation, which never counts as evidence.
+
+The target is `incident.service`, falling back to `incident.deployment`,
+and a `namespace` is required. A blank value counts as missing, and a
+missing target returns a `blocked` finding without opening a session.
+
+The investigator reports symptoms only and never states a cause. For
+`inventory-api` it says "Errors elevated, latency elevated, resources
+normal." Relating that to a Kubernetes crash loop is the Supervisor's
+job, not this specialist's. Thresholds are named constants and
+inclusive: error rate 5.0%, p95 1000 ms, CPU 90% and memory 90% of
+limits.
+
+| Metrics collected | Status | Evidence quality |
+|---|---|---|
+| 3 of 3 | `completed` | `limited` |
+| 1 or 2 of 3 | `partial` | `limited` |
+| 0 of 3 | `failed` | `insufficient` |
+| No namespace or service | `blocked` | `insufficient` |
+
+A `partial` finding is deliberately not usable evidence. The evidence
+gate requires status `completed`, so an incomplete metrics picture does
+not pass even though the metrics that were collected stay in the finding
+and the audit trail. An Observability-only incident with a partial
+finding therefore ends as `investigation_failed`. This is conservative
+for Phase 1.
+
+Architectural rule: only an eligible Kubernetes finding can currently
+support a rollout restart proposal. Observability findings can support
+investigation and evidence correlation, but cannot independently
+authorize remediation.
+
+The tools are allowlisted in `OBSERVABILITY_TOOL_ALLOWLIST`, separate
+from the Kubernetes allowlist. The guard rejects every other tool name,
+including the four Kubernetes MCP tools, and that rejection is not
+swallowed as an ordinary tool failure. The server itself exposes all
+seven tools to any client, so the allowlists are the only separation
+between the specialists.
+
 ## Safety properties
 
 | Property | Enforced in | Tested by |
@@ -106,7 +162,9 @@ cannot start becomes a failed finding.
 | A specialist failure does not crash the incident | `investigate` node | `test_supervisor_graph`, `test_supervisor_kubernetes_integration`, `test_supervisor_stdio_integration` |
 | Failed tool runs never count as evidence | `adapters.is_execution_failure` | `test_platform_state`, `test_supervisor_mcp_tools` |
 | The approval pause survives a process restart | SQLite checkpoint and serde allowlist | `test_platform_lifecycle`, `test_supervisor_graph`, `test_supervisor_stdio_integration` |
-| The agent graph does not overwrite the Supervisor's checkpoint | `compile(checkpointer=False)` | `test_supervisor_kubernetes_integration` (approved path) |
+| The agent graph does not overwrite the Supervisor's checkpoint | `compile(checkpointer=False)` | `test_supervisor_kubernetes_integration` (approved path) | Observability agent gets only allowlisted metrics tools | `guard_call_tool` in `observability.py` | `test_supervisor_observability` |
+| Observability findings never authorize remediation | `propose_action` filters on the Kubernetes agent | `test_supervisor_observability`, `test_supervisor_stdio_integration` (mixed incident) |
+| An incomplete metrics picture is not usable evidence | `is_usable` requires `completed` | `test_supervisor_observability`, `test_supervisor_stdio_integration` (unknown service) |
 | A specialist does not run again on resume | Checkpoint written after the `investigate` node | `test_supervisor_graph`, `test_supervisor_stdio_integration` |
 
 ## Tests
@@ -114,7 +172,8 @@ cannot start becomes a failed finding.
 `test_supervisor_routing`, `test_routing_eval`,
 `test_supervisor_components`, `test_supervisor_graph`,
 `test_supervisor_kubernetes_integration`, `test_supervisor_mcp_tools` and
-`test_supervisor_stdio_integration`, all under `app/`.
+`test_supervisor_observability` and `test_supervisor_stdio_integration`,
+all under `app/`.
 
 ## Running
 
@@ -130,9 +189,15 @@ cannot start becomes a failed finding.
 
 ## Known limitations
 
-- Only the Kubernetes specialist has an investigator. Incidents routed to
-  Observability or Security produce a `blocked` finding ("no
+- Only the Kubernetes and Observability specialists have investigators.
+  Incidents routed to Security produce a `blocked` finding ("no
   investigator registered").
+- `build_supervisor_graph` is called only from tests: no production entry
+  point builds the investigators mapping yet. That arrives with the
+  FastAPI phase.
+- There is no evidence correlation yet. Observability and Kubernetes
+  findings about the same workload are reported side by side, and
+  `Finding.contradicts` and `corroborated` quality are unused.
 - Only a crash loop produces a proposal. Other failure types (image pull
   errors, OOM kills) investigate but propose nothing.
 - Deployment name: the MCP adapter passes the pod name as the deployment
