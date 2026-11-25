@@ -6,13 +6,14 @@ from contextlib import asynccontextmanager
 
 import pytest
 
+from app.contracts.agent_messages import AgentEvidence
 from app.mcp_server import server
 from app.state.adapters import is_execution_failure
-from app.state.models import IncidentContext
+from app.state.models import Finding, IncidentContext
 from app.supervisor import observability as obs
 from app.supervisor import security as sec
 from app.supervisor.kubernetes_bridge import KUBERNETES_TOOL_ALLOWLIST
-from app.supervisor.proposals import is_usable
+from app.supervisor.proposals import is_usable, propose_action
 
 # Words that would turn a symptom into a cause, intent or remedy.
 BANNED_WORDS = (
@@ -469,4 +470,79 @@ def test_investigator_blocks_without_a_target_and_opens_no_session():
         assert not is_usable(finding)
     assert opened == []
     assert session.calls == []
+
+
+# --- remediation gate: Security can never authorize a restart ------------
+
+
+def crash_loop_incident() -> IncidentContext:
+    return make_incident(
+        description="Pod inventory-api is in CrashLoopBackOff",
+        pod_name="inventory-api",
+        deployment="inventory-api",
+        service="inventory-api",
+    )
+
+
+def finding_mentioning_crash_loop(agent_name, **overrides):
+    data = {
+        "agent_name": agent_name,
+        "summary": "CrashLoopBackOff, rollout restart needed",
+        "evidence": [
+            AgentEvidence(
+                source_tool="some_tool", observation="CrashLoopBackOff"
+            )
+        ],
+        "evidence_quality": "limited",
+    }
+    data.update(overrides)
+    return Finding(**data)
+
+
+def test_usable_security_finding_never_produces_a_proposal():
+    finding = finding_mentioning_crash_loop("security")
+    assert is_usable(finding)
+    assert propose_action(crash_loop_incident(), [finding]) is None
+
+
+def test_even_a_corroborated_security_finding_cannot_authorize():
+    finding = finding_mentioning_crash_loop(
+        "security", evidence_quality="corroborated"
+    )
+    assert is_usable(finding)
+    assert propose_action(crash_loop_incident(), [finding]) is None
+
+
+@pytest.mark.parametrize(
+    "service", ["payment-api", "inventory-api", "checkout-api"]
+)
+def test_real_security_findings_never_produce_a_proposal(service):
+    finding = collect(server_backend(), service=service)
+    assert is_usable(finding)
+    assert propose_action(crash_loop_incident(), [finding]) is None
+
+
+def test_mixed_findings_are_supported_only_by_the_kubernetes_finding():
+    kubernetes = finding_mentioning_crash_loop("kubernetes")
+    security = finding_mentioning_crash_loop("security")
+    action = propose_action(crash_loop_incident(), [security, kubernetes])
+    assert action is not None
+    assert action.action_type == "rollout_restart"
+    assert action.supporting_finding_ids == [kubernetes.finding_id]
+    assert security.finding_id not in action.supporting_finding_ids
+
+
+def test_a_usable_security_finding_cannot_stand_in_for_an_unusable_kubernetes_one():
+    kubernetes = finding_mentioning_crash_loop("kubernetes", status="partial")
+    security = finding_mentioning_crash_loop("security")
+    assert not is_usable(kubernetes)
+    assert propose_action(crash_loop_incident(), [kubernetes, security]) is None
+
+
+def test_security_with_observability_and_no_kubernetes_finding_proposes_nothing():
+    findings = [
+        finding_mentioning_crash_loop("security"),
+        finding_mentioning_crash_loop("observability"),
+    ]
+    assert propose_action(crash_loop_incident(), findings) is None
 
