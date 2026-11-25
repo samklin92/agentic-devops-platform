@@ -18,8 +18,10 @@ from app.supervisor.graph import build_supervisor_graph
 from app.supervisor.kubernetes_bridge import build_kubernetes_investigator
 from app.supervisor.mcp_tools import (
     mcp_session_tools_provider,
+    stdio_session,
     stdio_tools_provider,
 )
+from app.supervisor.observability import make_observability_investigator
 
 CONFIG = {"configurable": {"thread_id": "inc-001"}}
 
@@ -99,6 +101,23 @@ def stdio_investigators(opened: list[str]) -> dict:
     provider = counting(stdio_tools_provider(), opened)
     return {"kubernetes": build_kubernetes_investigator(provider)}
 
+def all_stdio_investigators(opened: list[str]) -> dict:
+    investigators = stdio_investigators(opened)
+    investigators["observability"] = make_observability_investigator(
+        stdio_session
+    )
+    return investigators
+
+def make_metrics_incident(**overrides) -> IncidentContext:
+    """An incident with no pod, so only metrics specialists can apply."""
+    data = {
+        "description": "High p95 latency on payment-api",
+        "pod_name": None,
+        "deployment": None,
+        "service": "payment-api",
+    }
+    data.update(overrides)
+    return make_incident(**data)
 
 def test_crash_loop_is_approved_end_to_end_over_stdio(db_path):
     opened: list[str] = []
@@ -190,5 +209,98 @@ def test_server_that_cannot_start_is_contained(db_path):
     assert finding.status == "failed"
     assert "cannot start MCP server" in finding.error_message
     assert "kubernetes_failed" in [e.event for e in result["audit_log"]]
+    assert result["proposed_action"] is None
+    assert result["report"].outcome == "investigation_failed"
+
+def test_metrics_only_incident_ends_without_a_proposal(db_path):
+    opened: list[str] = []
+
+    result, snapshot = run(
+        db_path,
+        all_stdio_investigators(opened),
+        new_platform_state(make_metrics_incident()),
+    )
+
+    assert snapshot.next == (), describe(snapshot)
+    assert opened == []  # Kubernetes was not routed
+    assert [f.agent_name for f in result["findings"]] == ["observability"]
+    finding = result["findings"][0]
+    assert finding.status == "completed"
+    assert finding.summary == "Metrics within normal thresholds."
+    assert result["proposed_action"] is None
+    assert result["report"].outcome == "no_action_proposed"
+    assert result["status"] == "completed"
+
+
+def test_unknown_service_ends_as_investigation_failed(db_path):
+    incident = make_metrics_incident(
+        description="Elevated error rate on ghost-api",
+        service="ghost-api",
+    )
+
+    result, snapshot = run(
+        db_path,
+        all_stdio_investigators([]),
+        new_platform_state(incident),
+    )
+
+    assert snapshot.next == (), describe(snapshot)
+    finding = result["findings"][0]
+    assert finding.agent_name == "observability"
+    assert finding.status == "failed"
+    assert "ghost-api" in finding.error_message
+    assert result["proposed_action"] is None
+    assert result["report"].outcome == "investigation_failed"
+    assert result["status"] == "failed"
+
+
+def test_mixed_incident_proposal_is_supported_only_by_kubernetes(db_path):
+    opened: list[str] = []
+    incident = make_incident(
+        description=(
+            "inventory-api is in CrashLoopBackOff with elevated error "
+            "rate and high p95 latency"
+        ),
+        service="inventory-api",
+    )
+
+    _, snapshot = run(
+        db_path,
+        all_stdio_investigators(opened),
+        new_platform_state(incident),
+    )
+
+    assert snapshot.next == ("approval",), describe(snapshot)
+    by_agent = {f.agent_name: f for f in snapshot.values["findings"]}
+    assert set(by_agent) == {"kubernetes", "observability"}
+    assert by_agent["observability"].summary == (
+        "Errors elevated, latency elevated, resources normal."
+    )
+    action = snapshot.values["proposed_action"]
+    assert action.action_type == "rollout_restart"
+    assert action.supporting_finding_ids == [
+        by_agent["kubernetes"].finding_id
+    ]
+    assert opened == ["inventory-api"]
+
+def test_observability_session_failure_is_contained(db_path):
+    @asynccontextmanager
+    async def broken_session():
+        raise RuntimeError("cannot start MCP server")
+        yield  # makes this an async generator
+
+    investigators = {
+        "observability": make_observability_investigator(broken_session)
+    }
+
+    result, snapshot = run(
+        db_path, investigators, new_platform_state(make_metrics_incident())
+    )
+
+    assert snapshot.next == (), describe(snapshot)
+    finding = result["findings"][0]
+    assert finding.status == "failed"
+    assert "cannot start MCP server" in finding.error_message
+    assert "observability_failed" in [e.event for e in result["audit_log"]]
     assert result["proposed_action"] is None
     assert result["report"].outcome == "investigation_failed"
