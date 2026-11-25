@@ -26,5 +26,12 @@
   {"id": "r25", "category": "out_of_scope", "incident": "Our AWS bill increased 40 percent this month", "expected": []},
   {"id": "r26", "category": "out_of_scope", "incident": "How do I write a Dockerfile for a Node app?", "expected": []},
   {"id": "r27", "category": "single", "hard": true, "incident": "Checkout keeps failing for about a third of customers", "expected": ["observability"]},
-  {"id": "r28", "category": "single", "hard": true, "incident": "Service restarts every few minutes with exit code 137", "expected": ["kubernetes"]}
+  {"id": "r28", "category": "single", "hard": true, "incident": "Service restarts every few minutes with exit code 137", "expected": ["kubernetes"]}, 
+  {"id": "r29", "category": "multi", "incident": "inventory-api is experiencing a crash loop, with increased HTTP 500 errors and latency", "expected": ["kubernetes", "observability"]},
+  {"id": "r30", "category": "single", "incident": "p95 latency is elevated on payment-api", "expected": ["observability"]},
+  {"id": "r31", "category": "single", "incident": "Spike in 5xx responses from the checkout API", "expected": ["observability"]},
+  {"id": "r32", "category": "single", "incident": "CPU saturation on the checkout service", "expected": ["observability"]},
+  {"id": "r33", "category": "single", "incident": "Memory pressure on the orders service", "expected": ["observability"]},
+  {"id": "r34", "category": "multi", "incident": "Memory pressure and OOMKilled pods on the orders service", "expected": ["kubernetes", "observability"]},
+  {"id": "r35", "category": "single", "incident": "Pod payment-api-5d8f is stuck in Pending", "expected": ["kubernetes"]}
 ]

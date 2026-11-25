@@ -46,7 +46,7 @@ SIGNAL_RULES: dict[SpecialistName, tuple[tuple[str, str], ...]] = {
         (
             "resource saturation",
             r"\b(?:cpu|memory|disk)\s(?:usage|utili[sz]ation|spikes?|saturation)\b"
-            r"|\bhigh (?:cpu|memory)\b",
+            r"|\bhigh (?:cpu|memory)\b|\bmemory pressure\b",
         ),
         (
             "monitoring tool",

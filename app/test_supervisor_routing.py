@@ -72,3 +72,36 @@ def test_every_specialist_has_rules_with_unique_labels():
     for rules in SIGNAL_RULES.values():
         labels = [label for label, _ in rules]
         assert len(labels) == len(set(labels))
+
+def test_mixed_crash_loop_and_http_500_routes_to_both_specialists():
+    decision = route_text(
+        "inventory-api is experiencing a crash loop, "
+        "with increased HTTP 500 errors and latency"
+    )
+    assert decision.selected_agents == ["kubernetes", "observability"]
+
+
+def test_metrics_signals_route_to_observability_only():
+    for text in [
+        "High error rate on the login service",
+        "HTTP 500 errors from the gateway",
+        "Spike in 5xx responses from the checkout API",
+        "p95 latency is elevated on payment-api",
+        "p99 latency doubled overnight",
+        "CPU saturation on the checkout service",
+        "Memory pressure on the orders service",
+        "Metrics anomaly on the gateway",
+    ]:
+        assert agents(text) == ["observability"], text
+
+
+def test_pod_without_a_metrics_signal_does_not_route_to_observability():
+    assert agents("Pod payment-api-5d8f is stuck in Pending") == ["kubernetes"]
+
+
+def test_named_pod_plus_metrics_signal_routes_to_both():
+    incident = make_incident(
+        "p95 latency is elevated", pod_name="payment-api-5d8f"
+    )
+    decision = route_incident(incident)
+    assert decision.selected_agents == ["kubernetes", "observability"]
