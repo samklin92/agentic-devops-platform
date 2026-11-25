@@ -29,6 +29,12 @@ METRICS_TOOLS = {
     "get_resource_usage",
 }
 
+SECURITY_TOOLS = {
+    "get_failed_auth_attempts",
+    "get_iam_activity",
+    "check_network_exposure",
+}
+
 
 def test_mcp_server_registers_all_diagnostic_tools():
 
@@ -38,8 +44,12 @@ def test_mcp_server_registers_all_diagnostic_tools():
         tool.name for tool in result
     }
 
-    assert registered_tool_names == KUBERNETES_TOOLS | METRICS_TOOLS
+    assert registered_tool_names == (
+        KUBERNETES_TOOLS | METRICS_TOOLS | SECURITY_TOOLS
+    )
     assert KUBERNETES_TOOLS.isdisjoint(METRICS_TOOLS)
+    assert KUBERNETES_TOOLS.isdisjoint(SECURITY_TOOLS)
+    assert METRICS_TOOLS.isdisjoint(SECURITY_TOOLS)
 
 def test_adapter_inspects_pod_events():
 
@@ -386,3 +396,104 @@ def test_metric_window_rejects_invalid_values(window):
         ),
     ):
         assert "error" in result
+
+
+def test_security_tools_return_distinct_scenarios():
+    quiet = kubernetes_server.get_failed_auth_attempts(
+        service="payment-api", namespace="production"
+    )
+    noisy = kubernetes_server.get_failed_auth_attempts(
+        service="checkout-api", namespace="production"
+    )
+    assert quiet["failed_auth_count"] < 10
+    assert noisy["failed_auth_count"] >= 1000
+    assert noisy["distinct_source_ips"] > quiet["distinct_source_ips"]
+
+
+def test_security_tools_are_namespace_specific():
+    production = kubernetes_server.get_iam_activity(
+        service="inventory-api", namespace="production"
+    )
+    staging = kubernetes_server.get_iam_activity(
+        service="inventory-api", namespace="staging"
+    )
+    assert production["credential_age_days"] == 20
+    assert staging["credential_age_days"] == 12
+    assert production["namespace"] == "production"
+    assert staging["namespace"] == "staging"
+
+
+def test_iam_activity_shows_stale_credential_scenario():
+    stale = kubernetes_server.get_iam_activity(
+        service="payment-api", namespace="production"
+    )
+    denied = kubernetes_server.get_iam_activity(
+        service="checkout-api", namespace="production"
+    )
+    assert stale["credential_age_days"] >= 90
+    assert stale["access_denied_calls"] == 0
+    assert denied["access_denied_calls"] >= 10
+
+
+def test_network_exposure_returns_booleans_and_one_exposed_scenario():
+    exposed = kubernetes_server.check_network_exposure(
+        service="checkout-api", namespace="production"
+    )
+    private = kubernetes_server.check_network_exposure(
+        service="payment-api", namespace="production"
+    )
+    for result in (exposed, private):
+        assert isinstance(result["publicly_exposed"], bool)
+        assert isinstance(result["open_ingress_cidr"], bool)
+    assert exposed["publicly_exposed"] and exposed["open_ingress_cidr"]
+    assert not private["publicly_exposed"]
+    assert not private["open_ingress_cidr"]
+
+
+def test_every_metrics_service_has_security_data():
+    metrics_keys = set(kubernetes_server.SIMULATED_ERROR_RATES)
+    assert metrics_keys == set(kubernetes_server.SIMULATED_FAILED_AUTH)
+    assert metrics_keys == set(kubernetes_server.SIMULATED_IAM_ACTIVITY)
+    assert metrics_keys == set(kubernetes_server.SIMULATED_NETWORK_EXPOSURE)
+
+
+def test_security_tools_return_error_not_zeros_for_unknown_service():
+    for result in (
+        kubernetes_server.get_failed_auth_attempts("ghost", "production", 15),
+        kubernetes_server.get_iam_activity("ghost", "production", 15),
+        kubernetes_server.check_network_exposure("ghost", "production"),
+    ):
+        assert "error" in result
+        assert not set(result) - {"error"}
+
+
+def test_security_tools_echo_the_window():
+    for tool in (
+        kubernetes_server.get_failed_auth_attempts,
+        kubernetes_server.get_iam_activity,
+    ):
+        result = tool(
+            service="payment-api", namespace="production", window_minutes=30
+        )
+        assert result["window_minutes"] == 30
+
+
+def test_security_window_accepts_the_bounds():
+    for tool in (
+        kubernetes_server.get_failed_auth_attempts,
+        kubernetes_server.get_iam_activity,
+    ):
+        for window in (
+            kubernetes_server.MIN_WINDOW_MINUTES,
+            kubernetes_server.MAX_WINDOW_MINUTES,
+        ):
+            assert "error" not in tool("payment-api", "production", window)
+
+
+@pytest.mark.parametrize("window", [0, -5, 1441, True, 1.5, "15"])
+def test_security_window_rejects_invalid_values(window):
+    for tool in (
+        kubernetes_server.get_failed_auth_attempts,
+        kubernetes_server.get_iam_activity,
+    ):
+        assert "error" in tool("payment-api", "production", window)

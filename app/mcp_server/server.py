@@ -1,4 +1,5 @@
-"""Read-only MCP server for Kubernetes diagnostics and service metrics."""
+"""Read-only MCP server for Kubernetes diagnostics, service metrics and
+service security signals."""
 
 from mcp.server import MCPServer
 
@@ -7,8 +8,9 @@ mcp = MCPServer(
     name="devops-kubernetes-server",
     version="1.0.0",
     instructions=(
-        "Provides read-only Kubernetes diagnostic tools and "
-        "read-only service metrics tools."
+        "Provides read-only Kubernetes diagnostic tools, "
+        "read-only service metrics tools and "
+        "read-only service security signal tools."
     ),
 )
 
@@ -167,6 +169,57 @@ SIMULATED_RESOURCE_USAGE = {
     },
     ("production", "checkout-api"): {
         "cpu_pct_of_limit": 96, "memory_pct_of_limit": 61,
+    },
+}
+
+
+# Service security signals, identified by (namespace, service). Every
+# service that has metrics also has security data. A service with no
+# entry returns an error, never zeros: "no data" must not look like
+# "nothing found".
+
+SIMULATED_FAILED_AUTH = {
+    ("production", "payment-api"): {
+        "failed_auth_count": 3, "distinct_source_ips": 2,
+    },
+    ("production", "inventory-api"): {
+        "failed_auth_count": 1, "distinct_source_ips": 1,
+    },
+    ("staging", "inventory-api"): {
+        "failed_auth_count": 0, "distinct_source_ips": 0,
+    },
+    ("production", "checkout-api"): {
+        "failed_auth_count": 1840, "distinct_source_ips": 212,
+    },
+}
+
+SIMULATED_IAM_ACTIVITY = {
+    ("production", "payment-api"): {
+        "access_denied_calls": 0, "credential_age_days": 95,
+    },
+    ("production", "inventory-api"): {
+        "access_denied_calls": 0, "credential_age_days": 20,
+    },
+    ("staging", "inventory-api"): {
+        "access_denied_calls": 0, "credential_age_days": 12,
+    },
+    ("production", "checkout-api"): {
+        "access_denied_calls": 37, "credential_age_days": 40,
+    },
+}
+
+SIMULATED_NETWORK_EXPOSURE = {
+    ("production", "payment-api"): {
+        "publicly_exposed": False, "open_ingress_cidr": False,
+    },
+    ("production", "inventory-api"): {
+        "publicly_exposed": False, "open_ingress_cidr": False,
+    },
+    ("staging", "inventory-api"): {
+        "publicly_exposed": False, "open_ingress_cidr": False,
+    },
+    ("production", "checkout-api"): {
+        "publicly_exposed": True, "open_ingress_cidr": True,
     },
 }
 
@@ -355,6 +408,93 @@ def get_resource_usage(
     """Retrieve resource usage for a service in a specific namespace."""
 
     data = SIMULATED_RESOURCE_USAGE.get((namespace, service))
+    if data is None:
+        return _service_not_found(service, namespace)
+
+    return {
+        "service": service,
+        "namespace": namespace,
+        **data,
+    }
+
+
+@mcp.tool(
+    name="get_failed_auth_attempts",
+    description=(
+        "Get a service's failed authentication count and the number of "
+        "distinct source IPs over a recent time window."
+    ),
+    structured_output=True,
+)
+def get_failed_auth_attempts(
+    service: str,
+    namespace: str,
+    window_minutes: int = 15,
+) -> dict[str, str | int]:
+    """Retrieve failed authentication counts for a service."""
+
+    window_error = _window_error(window_minutes)
+    if window_error is not None:
+        return window_error
+
+    data = SIMULATED_FAILED_AUTH.get((namespace, service))
+    if data is None:
+        return _service_not_found(service, namespace)
+
+    return {
+        "service": service,
+        "namespace": namespace,
+        "window_minutes": window_minutes,
+        **data,
+    }
+
+
+@mcp.tool(
+    name="get_iam_activity",
+    description=(
+        "Get a service identity's access-denied call count over a recent "
+        "time window and the age of its credentials in days."
+    ),
+    structured_output=True,
+)
+def get_iam_activity(
+    service: str,
+    namespace: str,
+    window_minutes: int = 15,
+) -> dict[str, str | int]:
+    """Retrieve IAM activity for a service in a specific namespace."""
+
+    window_error = _window_error(window_minutes)
+    if window_error is not None:
+        return window_error
+
+    data = SIMULATED_IAM_ACTIVITY.get((namespace, service))
+    if data is None:
+        return _service_not_found(service, namespace)
+
+    return {
+        "service": service,
+        "namespace": namespace,
+        "window_minutes": window_minutes,
+        **data,
+    }
+
+
+@mcp.tool(
+    name="check_network_exposure",
+    description=(
+        "Check whether a service is publicly exposed and whether it "
+        "allows ingress from 0.0.0.0/0."
+    ),
+    structured_output=True,
+)
+def check_network_exposure(
+    service: str,
+    namespace: str,
+) -> dict[str, str | bool]:
+    """Retrieve network exposure for a service in a specific namespace."""
+
+    data = SIMULATED_NETWORK_EXPOSURE.get((namespace, service))
     if data is None:
         return _service_not_found(service, namespace)
 
