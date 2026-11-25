@@ -24,15 +24,30 @@ Kubernetes finding can support a rollout restart proposal.
 
 import asyncio
 import json
-from collections.abc import Awaitable, Callable, Mapping
-from contextlib import AbstractAsyncContextManager
-from dataclasses import dataclass
 from typing import Any
 
 from app.contracts.agent_messages import AgentEvidence
 from app.state.adapters import MAX_SUMMARY_CHARS
 from app.state.models import Finding, IncidentContext
 from app.supervisor.investigators import Investigator
+from app.supervisor.specialist_common import (
+    CallTool,
+    SessionFactory,
+    ToolNotAllowedError,  # noqa: F401  (re-exported for callers and tests)
+    ToolResult,
+    guard_call_tool as _guard_call_tool,
+    is_number,
+    resolve_workload_target,
+    run_tool_sequence,
+    session_call_tool,
+    validation_error,
+)
+
+# These names now live in specialist_common. They stay importable from
+# here so existing callers and tests do not change.
+MetricResult = ToolResult
+resolve_target = resolve_workload_target
+_session_call_tool = session_call_tool
 
 WINDOW_MINUTES = 15
 
@@ -60,74 +75,23 @@ _REQUIRED_FIELDS = {
     TOOL_RESOURCES: ("cpu_pct_of_limit", "memory_pct_of_limit"),
 }
 
-CallTool = Callable[[str, dict[str, Any]], Awaitable[Mapping[str, Any]]]
-SessionFactory = Callable[[], AbstractAsyncContextManager[Any]]
-
-
-class ToolNotAllowedError(ValueError):
-    """The Observability agent tried to call a tool outside its allowlist."""
-
-
-@dataclass(frozen=True)
-class MetricResult:
-    tool: str
-    data: Mapping[str, Any] | None = None
-    error: str | None = None
-
-    @property
-    def ok(self) -> bool:
-        return self.error is None
-
-
-def resolve_target(incident: IncidentContext) -> tuple[str, str] | None:
-    """Return (namespace, service), or None if the incident lacks either."""
-    namespace = (incident.namespace or "").strip()
-    service = (incident.service or "").strip() or (
-        incident.deployment or ""
-    ).strip()
-    if not namespace or not service:
-        return None
-    return namespace, service
-
 
 def guard_call_tool(call_tool: CallTool) -> CallTool:
-    """Wrap a tool caller so only allowlisted tools can be called."""
-
-    async def guarded(name: str, arguments: dict[str, Any]):
-        if name not in OBSERVABILITY_TOOL_ALLOWLIST:
-            raise ToolNotAllowedError(
-                f"Tool not allowed for the Observability agent: {name}"
-            )
-        return await call_tool(name, arguments)
-
-    return guarded
-
-
-def _is_number(value: Any) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
+    """Wrap a tool caller so only Observability tools can be called."""
+    return _guard_call_tool(
+        call_tool, OBSERVABILITY_TOOL_ALLOWLIST, "Observability"
+    )
 
 
 def _validation_error(tool: str, result: Any) -> str | None:
-    if not isinstance(result, Mapping):
-        return "invalid response"
-    if result.get("error"):
-        return str(result["error"])
-    missing = [
-        field
-        for field in _REQUIRED_FIELDS[tool]
-        if not _is_number(result.get(field))
-    ]
-    if missing:
-        return f"response missing numeric fields: {missing}"
-    return None
+    return validation_error(result, _REQUIRED_FIELDS[tool], is_number, "numeric")
 
 
 async def collect_metrics(
     call_tool: CallTool, namespace: str, service: str
 ) -> list[MetricResult]:
     """Run the three metrics calls. One failure never stops the others."""
-    call_tool = guard_call_tool(call_tool)
-    results: list[MetricResult] = []
+    calls: list[tuple[str, dict[str, Any]]] = []
     for tool in _SEQUENCE:
         arguments: dict[str, Any] = {
             "service": service,
@@ -135,19 +99,10 @@ async def collect_metrics(
         }
         if tool != TOOL_RESOURCES:
             arguments["window_minutes"] = WINDOW_MINUTES
-        try:
-            data = await call_tool(tool, arguments)
-        except ToolNotAllowedError:
-            raise
-        except Exception as exc:  # contain per-tool failures
-            results.append(MetricResult(tool=tool, error=str(exc)))
-            continue
-        error = _validation_error(tool, data)
-        if error is not None:
-            results.append(MetricResult(tool=tool, error=error))
-        else:
-            results.append(MetricResult(tool=tool, data=data))
-    return results
+        calls.append((tool, arguments))
+    return await run_tool_sequence(
+        guard_call_tool(call_tool), calls, _validation_error
+    )
 
 
 def _observation(result: MetricResult) -> str:
@@ -254,19 +209,6 @@ def _blocked_finding() -> Finding:
         status="blocked",
         error_message="Missing namespace or service/deployment.",
     )
-
-
-def _session_call_tool(session: Any) -> CallTool:
-    async def call(name: str, arguments: dict[str, Any]):
-        response = await session.call_tool(name, arguments=arguments)
-        if response.is_error:
-            raise RuntimeError(f"MCP tool '{name}' returned an error.")
-        content = response.structured_content
-        if not isinstance(content, Mapping):
-            raise RuntimeError(f"MCP tool '{name}' returned an invalid response.")
-        return content
-
-    return call
 
 
 def make_observability_investigator(
