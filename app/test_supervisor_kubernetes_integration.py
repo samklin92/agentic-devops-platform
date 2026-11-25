@@ -7,6 +7,7 @@ from langgraph.types import Command
 from app.state.graph_state import new_platform_state
 from app.state.models import IncidentContext
 from app.state.serde import platform_serializer
+from app.supervisor.observability import OBSERVABILITY_TOOL_ALLOWLIST
 from app.supervisor.graph import build_supervisor_graph
 from app.supervisor.kubernetes_bridge import (
     KUBERNETES_TOOL_ALLOWLIST,
@@ -197,6 +198,10 @@ def test_validate_tool_allowlist_accepts_known_and_rejects_unknown_tools():
     with pytest.raises(ValueError, match="delete_pod"):
         validate_tool_allowlist({"inspect_pod_events": None, "delete_pod": None})
 
+def test_kubernetes_rejects_observability_tools():
+    for tool in sorted(OBSERVABILITY_TOOL_ALLOWLIST):
+        with pytest.raises(ValueError, match=tool):
+            validate_tool_allowlist({tool: None})
 
 def test_allowlist_contains_only_the_known_read_only_tools():
     assert KUBERNETES_TOOL_ALLOWLIST == {

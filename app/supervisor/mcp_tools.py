@@ -15,7 +15,9 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 from app.mcp_server.adapter import build_mcp_tools
+from app.supervisor.investigators import Investigator
 from app.supervisor.kubernetes_bridge import ToolsProvider
+from app.supervisor.observability import make_observability_investigator
 
 INITIALIZE_TIMEOUT_SECONDS = 20
 
@@ -62,3 +64,8 @@ async def stdio_session():
 def stdio_tools_provider() -> ToolsProvider:
     """Tools provider backed by the simulated MCP server over stdio."""
     return mcp_session_tools_provider(stdio_session)
+
+
+def stdio_observability_investigator() -> Investigator:
+    """Observability investigator backed by the simulated MCP server."""
+    return make_observability_investigator(stdio_session)

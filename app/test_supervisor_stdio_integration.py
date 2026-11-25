@@ -18,7 +18,7 @@ from app.supervisor.graph import build_supervisor_graph
 from app.supervisor.kubernetes_bridge import build_kubernetes_investigator
 from app.supervisor.mcp_tools import (
     mcp_session_tools_provider,
-    stdio_session,
+    stdio_observability_investigator,
     stdio_tools_provider,
 )
 from app.supervisor.observability import make_observability_investigator
@@ -103,9 +103,7 @@ def stdio_investigators(opened: list[str]) -> dict:
 
 def all_stdio_investigators(opened: list[str]) -> dict:
     investigators = stdio_investigators(opened)
-    investigators["observability"] = make_observability_investigator(
-        stdio_session
-    )
+    investigators["observability"] = stdio_observability_investigator()
     return investigators
 
 def make_metrics_incident(**overrides) -> IncidentContext:
