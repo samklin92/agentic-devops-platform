@@ -11,6 +11,7 @@ from app.state.adapters import is_execution_failure
 from app.state.models import IncidentContext
 from app.supervisor import observability as obs
 from app.supervisor import security as sec
+from app.supervisor.kubernetes_bridge import KUBERNETES_TOOL_ALLOWLIST
 from app.supervisor.proposals import is_usable
 
 # Words that would turn a symptom into a cause, intent or remedy.
@@ -388,6 +389,31 @@ def test_guard_rejects_other_specialists_and_unknown_tools(tool):
     guarded = sec.guard_call_tool(server_backend())
     with pytest.raises(sec.ToolNotAllowedError, match="Security agent"):
         asyncio.run(guarded(tool, {}))
+
+
+@pytest.mark.parametrize("tool", sorted(sec.SECURITY_TOOL_ALLOWLIST))
+def test_observability_guard_rejects_security_tools(tool):
+    guarded = obs.guard_call_tool(server_backend())
+    with pytest.raises(obs.ToolNotAllowedError, match="Observability agent"):
+        asyncio.run(guarded(tool, {}))
+
+
+@pytest.mark.parametrize("tool", sorted(KUBERNETES_TOOL_ALLOWLIST))
+def test_both_guards_reject_the_kubernetes_agent_tools(tool):
+    for guard in (sec.guard_call_tool, obs.guard_call_tool):
+        guarded = guard(server_backend())
+        with pytest.raises(sec.ToolNotAllowedError):
+            asyncio.run(guarded(tool, {}))
+
+
+def test_no_tool_is_allowed_for_more_than_one_mcp_specialist():
+    assert sec.SECURITY_TOOL_ALLOWLIST.isdisjoint(
+        obs.OBSERVABILITY_TOOL_ALLOWLIST
+    )
+    assert KUBERNETES_TOOL_ALLOWLIST.isdisjoint(sec.SECURITY_TOOL_ALLOWLIST)
+    assert KUBERNETES_TOOL_ALLOWLIST.isdisjoint(
+        obs.OBSERVABILITY_TOOL_ALLOWLIST
+    )
 
 
 def test_allowlist_violation_is_not_swallowed_as_a_tool_failure(monkeypatch):

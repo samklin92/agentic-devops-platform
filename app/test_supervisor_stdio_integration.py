@@ -19,9 +19,11 @@ from app.supervisor.kubernetes_bridge import build_kubernetes_investigator
 from app.supervisor.mcp_tools import (
     mcp_session_tools_provider,
     stdio_observability_investigator,
+    stdio_security_investigator,
     stdio_tools_provider,
 )
 from app.supervisor.observability import make_observability_investigator
+from app.supervisor.security import make_security_investigator
 
 CONFIG = {"configurable": {"thread_id": "inc-001"}}
 
@@ -104,6 +106,7 @@ def stdio_investigators(opened: list[str]) -> dict:
 def all_stdio_investigators(opened: list[str]) -> dict:
     investigators = stdio_investigators(opened)
     investigators["observability"] = stdio_observability_investigator()
+    investigators["security"] = stdio_security_investigator()
     return investigators
 
 def make_metrics_incident(**overrides) -> IncidentContext:
@@ -300,5 +303,133 @@ def test_observability_session_failure_is_contained(db_path):
     assert finding.status == "failed"
     assert "cannot start MCP server" in finding.error_message
     assert "observability_failed" in [e.event for e in result["audit_log"]]
+    assert result["proposed_action"] is None
+    assert result["report"].outcome == "investigation_failed"
+
+
+def make_security_incident(**overrides) -> IncidentContext:
+    """An incident with no pod, so only the Security specialist applies."""
+    data = {
+        "description": "Spike in failed logins against the checkout-api",
+        "pod_name": None,
+        "deployment": None,
+        "service": "checkout-api",
+    }
+    data.update(overrides)
+    return make_incident(**data)
+
+
+def test_security_only_incident_ends_without_a_proposal(db_path):
+    opened: list[str] = []
+
+    result, snapshot = run(
+        db_path,
+        all_stdio_investigators(opened),
+        new_platform_state(make_security_incident()),
+    )
+
+    assert snapshot.next == (), describe(snapshot)
+    assert opened == []  # Kubernetes was not routed
+    assert [f.agent_name for f in result["findings"]] == ["security"]
+    finding = result["findings"][0]
+    assert finding.status == "completed"
+    assert finding.summary == (
+        "Failed authentication elevated, IAM access-denied calls elevated, "
+        "publicly exposed, ingress open to 0.0.0.0/0."
+    )
+    assert result["proposed_action"] is None
+    assert result["report"].outcome == "no_action_proposed"
+    assert result["status"] == "completed"
+
+
+def test_unknown_security_service_ends_as_investigation_failed(db_path):
+    incident = make_security_incident(
+        description="Failed logins against ghost-api",
+        service="ghost-api",
+    )
+
+    result, snapshot = run(
+        db_path,
+        all_stdio_investigators([]),
+        new_platform_state(incident),
+    )
+
+    assert snapshot.next == (), describe(snapshot)
+    finding = result["findings"][0]
+    assert finding.agent_name == "security"
+    assert finding.status == "failed"
+    assert "ghost-api" in finding.error_message
+    assert result["proposed_action"] is None
+    assert result["report"].outcome == "investigation_failed"
+    assert result["status"] == "failed"
+
+
+def test_security_incident_without_a_workload_is_blocked(db_path):
+    incident = make_security_incident(
+        description="Exposed credentials found in a public repository",
+        service=None,
+    )
+
+    result, snapshot = run(
+        db_path,
+        all_stdio_investigators([]),
+        new_platform_state(incident),
+    )
+
+    assert snapshot.next == (), describe(snapshot)
+    finding = result["findings"][0]
+    assert finding.agent_name == "security"
+    assert finding.status == "blocked"
+    assert result["proposed_action"] is None
+
+
+def test_mixed_incident_proposal_excludes_the_security_finding(db_path):
+    opened: list[str] = []
+    incident = make_incident(
+        description=(
+            "inventory-api is in CrashLoopBackOff with failed logins "
+            "and elevated error rate"
+        ),
+        service="inventory-api",
+    )
+
+    _, snapshot = run(
+        db_path,
+        all_stdio_investigators(opened),
+        new_platform_state(incident),
+    )
+
+    assert snapshot.next == ("approval",), describe(snapshot)
+    by_agent = {f.agent_name: f for f in snapshot.values["findings"]}
+    assert set(by_agent) == {"kubernetes", "observability", "security"}
+    assert by_agent["security"].summary == (
+        "No elevated security signals in the checks run."
+    )
+    action = snapshot.values["proposed_action"]
+    assert action.action_type == "rollout_restart"
+    assert action.supporting_finding_ids == [
+        by_agent["kubernetes"].finding_id
+    ]
+
+
+def test_security_session_failure_is_contained(db_path):
+    @asynccontextmanager
+    async def broken_session():
+        raise RuntimeError("cannot start MCP server")
+        yield  # makes this an async generator
+
+    investigators = {
+        "security": make_security_investigator(broken_session)
+    }
+
+    result, snapshot = run(
+        db_path, investigators, new_platform_state(make_security_incident())
+    )
+
+    assert snapshot.next == (), describe(snapshot)
+    finding = result["findings"][0]
+    assert finding.status == "failed"
+    assert "cannot start MCP server" in finding.error_message
+    assert "security_failed" in [e.event for e in result["audit_log"]]
     assert result["proposed_action"] is None
     assert result["report"].outcome == "investigation_failed"

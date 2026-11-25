@@ -18,6 +18,7 @@ from app.mcp_server.adapter import build_mcp_tools
 from app.supervisor.investigators import Investigator
 from app.supervisor.kubernetes_bridge import ToolsProvider
 from app.supervisor.observability import make_observability_investigator
+from app.supervisor.security import make_security_investigator
 
 INITIALIZE_TIMEOUT_SECONDS = 20
 
@@ -69,3 +70,8 @@ def stdio_tools_provider() -> ToolsProvider:
 def stdio_observability_investigator() -> Investigator:
     """Observability investigator backed by the simulated MCP server."""
     return make_observability_investigator(stdio_session)
+
+
+def stdio_security_investigator() -> Investigator:
+    """Security investigator backed by the simulated MCP server."""
+    return make_security_investigator(stdio_session)
