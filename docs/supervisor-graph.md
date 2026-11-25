@@ -6,8 +6,8 @@ documented in `docs/shared-state-schema.md`.
 ## Purpose
 
 The Supervisor receives an incident, routes it to specialist agents,
-evaluates their findings, proposes a remediation only when the evidence
-supports one, pauses for human approval, simulates the approved action
+records how their findings relate to each other, evaluates them, proposes
+a remediation only when the evidence supports one, pauses for human approval, simulates the approved action
 and produces the final report. Phase 1 is propose-only: nothing real is
 executed.
 
@@ -17,8 +17,9 @@ executed.
 |---|---|---|
 | `receive_alert` | Records the alert | `route` |
 | `route` | Rule-based routing; no match means no specialist | `investigate`, or `report` if nothing matched |
-| `investigate` | Calls each selected specialist within its call budget | `evaluate` |
-| `evaluate` | Builds a proposal from usable evidence, or none | `approval`, or `report` if no proposal |
+| `investigate` | Calls each selected specialist within its call budget | `correlate` |
+| `correlate` | Records how the findings relate (Supervisor step, counts as a hop) | `evaluate` |
+| `evaluate` | Builds a proposal from usable evidence, or none; adds correlation notes to an existing proposal | `approval`, or `report` if no proposal |
 | `approval` | Pauses with `interrupt()`; records the human decision | `execute` if approved, otherwise `report` |
 | `execute` | Simulated execution only | `report` |
 | `report` | Final `IncidentReport` and status | End |
@@ -69,12 +70,86 @@ the same description still routes to Kubernetes.
 - No usable evidence means no proposal and no approval request; the
   report says human review is needed.
 
+## Correlation (`app/supervisor/correlation.py`)
+
+The separation of roles is the point of this step. Specialists produce
+observations and findings. The Supervisor identifies relationships
+between findings. The proposal gate independently decides whether an
+action is eligible. A human makes the approval decision. Correlation
+annotates evidence and never authorizes action.
+
+**Signals.** A finding carries structured `signals` from a closed
+vocabulary, and each specialist may emit only its own:
+
+| Specialist | Signals |
+|---|---|
+| Kubernetes | `crash_loop` |
+| Observability | `errors_elevated`, `latency_elevated`, `cpu_saturated`, `memory_near_limit` |
+| Security | `failed_auth_elevated`, `iam_denied_elevated`, `credential_stale`, `publicly_exposed`, `open_ingress` |
+
+A signal is emitted only when the check that supports it succeeded. A
+failed, malformed or missing check produces no signal, and its absence is
+never read as a clean result. A failed or blocked finding cannot carry
+signals at all (the `Finding` model rejects it). Observability and
+Security build their summary text from the same signals, so text and
+signals cannot disagree. Kubernetes gets `crash_loop` only from a
+successful diagnostic observation and the agent's findings, never from an
+error message or a failed tool run, using the same pattern as the
+proposal gate (`app/state/signals.py`), so there is one definition of a
+crash loop.
+
+**Rules.** Only usable findings take part, and every relation needs two
+different specialists:
+
+| Rule | Condition | Kind |
+|---|---|---|
+| R1 `shared_incident_impact` | Kubernetes `crash_loop` and Observability `errors_elevated` or `latency_elevated` | `corroborates` |
+| C1 `impact_not_observed` | Kubernetes `crash_loop` and an Observability finding that completed every check, with no failed-run observations and no signals | `contradicts` |
+| R2 `load_with_failed_auth` | Observability `latency_elevated` or `cpu_saturated` and Security `failed_auth_elevated` | `co_occurs` |
+
+R1 says independent specialists support a shared incident-impact
+hypothesis and states that this does not establish the cause of the crash
+loop. C1 never fires on a partial, failed or unfinished Observability
+investigation. R2 says co-occurrence does not establish causation and
+implies no remediation, and it is never a corroboration. Explanations are
+built from signal names and fixed caveats, and tests reject causal and
+remediation wording.
+
+**How the result is computed.** `correlate(findings)` is pure and
+deterministic. It looks only at the latest attempt per specialist, leaves
+out a specialist whose finding ID is ambiguous (the same ID on two
+different records), and gives the same correlations, with the same IDs,
+in any input order. The `correlate` node recomputes the whole list from
+the current findings each time and replaces `PlatformState.correlations`,
+so a repeated investigation cannot leave stale relationships. It writes
+one `correlation_recorded` audit entry per correlation.
+
+**What it may do.** Add explanatory text to the rationale of a proposal
+that already exists (`annotate_action`), add a structured `correlations`
+list to the approval payload, and add an "Evidence relationships" clause
+to the report summary. `effective_quality(finding, correlations)` gives a
+derived reading of "corroborated" for a usable finding that another
+specialist corroborates. It never changes the finding, and the proposal
+gate never uses it.
+
+**What it may not do.** Create a proposal, remove one, change its risk
+level or its supporting finding IDs, authorize execution or override the
+human decision. `propose_action(incident, findings)` is unchanged and
+takes no correlations. Tests compare proposals with and without
+correlations across many finding combinations, and the only permitted
+difference is the rationale text.
+
+The correlation step counts as a Supervisor hop, so an investigated
+incident uses 5 of the 6 hops (receive, route, correlate, evaluate,
+report).
+
 ## Approval
 
 `approval` pauses the graph with a payload describing the action. The
 resume value must be a dict with a boolean `approved` and a non-empty
 `decided_by`; anything else raises an error, so a malformed payload can
-never count as approval (`parse_decision`).
+never count as approval (`parse_decision`). The payload also lists the
+action's correlations, so the approver sees how the evidence relates.
 
 ## Failure containment
 
@@ -244,6 +319,13 @@ metrics and security groups is tested in `test_mcp_server`.
 | Security findings never authorize or support remediation | `propose_action` filters on the Kubernetes agent | `test_supervisor_security` (gate tests), `test_supervisor_stdio_integration` (mixed incident) |
 | Tool output cannot inject text into a Security finding | Evidence built from validated numbers and booleans | `test_supervisor_security` |
 | A missing target is an error or `blocked`, never a clean result | Server returns `error`; `blocked` and `failed` findings | `test_mcp_server`, `test_supervisor_security`, `test_supervisor_stdio_integration` |
+| Correlation never changes whether a proposal exists, its risk or its supporting findings | `propose_action` is unchanged; `annotate_action` only extends rationale text and returns `None` for `None` | `test_supervisor_correlation` (combination test), `test_supervisor_graph`, `test_supervisor_stdio_integration` |
+| Only usable findings from two different specialists correlate | `correlate` | `test_supervisor_correlation` |
+| Signals come only from checks that succeeded | Specialist `_signals`, `Finding` validator, Kubernetes adapter | `test_supervisor_observability`, `test_supervisor_security`, `test_platform_state`, `test_state_models` |
+| Co-occurrence is never read as corroboration or causation | R2 kind and caveat | `test_supervisor_correlation`, `test_supervisor_graph` |
+| Correlations are recomputed, never accumulated | `correlate` node | `test_supervisor_graph`, `test_supervisor_correlation` |
+| Checkpoints from before correlations existed still resume | `current_correlations` tolerates a missing field | `test_supervisor_graph` |
+| One definition of a crash loop | `app/state/signals.py` | `test_state_signals`, `test_platform_state` |
 | An incomplete metrics picture is not usable evidence | `is_usable` requires `completed` | `test_supervisor_observability`, `test_supervisor_stdio_integration` (unknown service) |
 | A specialist does not run again on resume | Checkpoint written after the `investigate` node | `test_supervisor_graph`, `test_supervisor_stdio_integration` |
 
@@ -251,6 +333,7 @@ metrics and security groups is tested in `test_mcp_server`.
 
 `test_supervisor_routing`, `test_routing_eval`,
 `test_supervisor_components`, `test_supervisor_graph`,
+`test_supervisor_correlation`, `test_state_signals`,
 `test_supervisor_kubernetes_integration`, `test_supervisor_mcp_tools`, `test_supervisor_observability`,
 `test_supervisor_security`, `test_mcp_server` and
 `test_supervisor_stdio_integration`, all under `app/`.
@@ -280,11 +363,21 @@ metrics and security groups is tested in `test_mcp_server`.
 - `build_supervisor_graph` is called only from tests: no production entry
   point builds the investigators mapping yet. That arrives with the
   FastAPI phase.
-- There is no evidence correlation yet. Kubernetes, Observability and
-  Security findings about the same workload are reported side by side,
-  and `Finding.contradicts` and `corroborated` quality are unused. A
-  Security finding that disagrees with a Kubernetes finding neither
-  blocks nor supports a proposal, and nothing yet reconciles them.
+- Correlation is a first version: three pairwise rules, and nothing
+  else is compared. Security findings are not compared with Kubernetes
+  findings, because Security makes no claims about pod state. All
+  findings in an incident are assumed to share its target, which holds
+  while an incident is a single workload.
+- A contradiction (C1) is the weakest rule, since normal metrics can
+  coexist with one crash-looping replica. It is shown to the approver and
+  never blocks a proposal. There is no veto, and no loop yet that would
+  ask a specialist for more evidence when findings disagree.
+- The proposal gate searches all evidence text, including failed-run
+  observations, while the Kubernetes `crash_loop` signal ignores them. A
+  failed run whose error text contained "crash loop" could therefore
+  satisfy the gate without producing the signal. The effect is safe (no
+  annotation, never an extra proposal), and both could be tightened
+  together later.
 - Only a crash loop produces a proposal. Other failure types (image pull
   errors, OOM kills) investigate but propose nothing.
 - Deployment name: the MCP adapter passes the pod name as the deployment
@@ -314,6 +407,8 @@ metrics and security groups is tested in `test_mcp_server`.
    specialist can reuse `app/supervisor/specialist_common.py`.
 3. Register it in the investigators mapping passed to
    `build_supervisor_graph`.
-4. Extend the signal rules and the routing eval set, and re-run the
-   evaluation.
+4. Extend the routing rules and the eval set and re-run the evaluation.
+   Add its signals to the closed vocabulary (emitted only from checks
+   that succeeded) and any correlation rules, with tests that the rules
+   cannot change a proposal.
 5. Add a proposal rule only for evidence that justifies one.

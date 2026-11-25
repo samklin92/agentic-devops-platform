@@ -35,7 +35,8 @@ call each other; they read and write shared state through the Supervisor.
 |---|---|---|
 | `IncidentContext` | The alert that started the incident | Non-empty ID, description, environment; unknown fields rejected; optional `namespace`, `pod_name`, `deployment` and `service` (a remediation proposal needs `namespace` and `deployment`; the Observability and Security specialists target `service`, falling back to `deployment`, which is a Phase 1 convenience because a Kubernetes Deployment name and a monitoring or security service identity are not necessarily the same) |
 | `RoutingDecision` | Supervisor's choice of specialists | At least one agent; only `kubernetes`, `observability`, `security`; reason required |
-| `Finding` | One specialist's conclusion and its evidence | Evidence quality above `insufficient` requires evidence; `attempt >= 1`; `contradicts` links conflicting findings |
+| `Finding` | One specialist's conclusion and its evidence | Evidence quality above `insufficient` requires evidence; `attempt >= 1`; optional `signals` from a closed vocabulary, each specialist limited to its own, no repeats, backed by evidence and never on a `failed` or `blocked` finding; `contradicts` is reserved and not written by any component |
+| `Correlation` | A relationship the Supervisor found between findings | Kind from a closed list (`corroborates`, `contradicts`, `co_occurs`); non-empty rule and explanation; at least two distinct, non-blank finding IDs; unknown fields rejected; written only by the Supervisor |
 | `ProposedAction` | A remediation proposal | At least one supporting finding ID; action type from a closed list; risk level required |
 | `ApprovalRecord` | The human decision | Pending cannot carry a decision; approved or rejected requires `decided_by`; `decided_at` is set automatically |
 | `ExecutionRecord` | Outcome of an executed action | `simulated` must be `True` in Phase 1 |
@@ -58,6 +59,7 @@ call each other; they read and write shared state through the Supervisor.
 | `approval` | Approval node | Last write wins |
 | `execution` | Supervisor | Last write wins |
 | `report` | Supervisor | Last write wins |
+| `correlations` | Supervisor | Last write wins; recomputed from the current findings each time, never accumulated |
 | `findings` | Specialists | Append |
 | `usage` | Any agent | Append |
 | `audit_log` | Any actor | Append |
@@ -118,6 +120,10 @@ On rejection, step 10 is skipped and the report outcome is
 - The allowlist is built from `app/state/models.py`, plus `AgentEvidence`,
   and contains only `app.*` modules. New records are covered
   automatically.
+- Records written before a field existed still load: `Finding.signals`
+  defaults to empty, and the graph reads `correlations` tolerantly, so a
+  checkpoint paused before correlations existed resumes and simply has
+  none.
 - A node that calls `interrupt()` re-runs from its top on resume, so
   nothing before the `interrupt()` call may have side effects.
 - A graph that runs inside a Supervisor node must be compiled with
@@ -131,13 +137,14 @@ On rejection, step 10 is skipped and the report outcome is
 - Only the Kubernetes, Observability and Security specialists exist.
 - `UsageRecord` is never populated: the current Kubernetes agent run
   makes no LLM calls.
-- `evidence_quality` is only `insufficient` or `limited` from all three specialists. `corroborated` is defined but nothing produces it yet. Observability deliberately does not produce it: its metrics are correlated signals, so two agreeing metrics are not independent evidence. Security does not produce it either: its three checks are separate signals about one workload, not confirmation from another specialist. It will be assigned by the later evidence-correlation step, when findings from different specialists agree.
+- `evidence_quality` is only `insufficient` or `limited` from all three specialists, and no component writes `corroborated` into a finding. Observability deliberately does not produce it: its metrics are correlated signals, so two agreeing metrics are not independent evidence. Security does not either: its three checks are separate signals about one workload. Corroboration across specialists is a `Correlation` record, and `effective_quality()` in `app/supervisor/correlation.py` gives a derived reading of "corroborated" without changing the finding. The proposal gate never uses it.
 - An empty tool result (for example no pod events) still counts as
   evidence, so a failed investigation of an unknown pod reports quality
   `limited`. The Supervisor's evidence gate still rejects it, because the
   finding is not `completed`.
-- `Finding.contradicts` is not used yet; there is no evidence correlation
-  logic.
+- `Finding.contradicts` is not written by anything. Contradictions are
+  expressed as `Correlation` records of kind `contradicts`. The field is
+  kept in the schema for now.
 - `IncidentReport.root_cause` is never populated.
 - Execution is simulated only.
 
