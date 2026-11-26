@@ -8,7 +8,12 @@ import pytest
 from app import evaluate_safety as ev
 from app.evaluate_safety import (
     CATEGORIES,
+    GATE_CHECKS,
+    GATE_INVARIANTS,
     INVARIANTS,
+    BuiltFindings,
+    GateImplementation,
+    GateRun,
     InvariantViolation,
     MutationOutcome,
     SafetyReport,
@@ -17,12 +22,15 @@ from app.evaluate_safety import (
     build_finding,
     build_findings,
     build_incident,
+    evaluate,
     exit_code,
     format_report,
     load_scenarios,
     main,
+    run_gate_scenario,
     validate_scenarios,
 )
+from app.supervisor.proposals import is_usable, propose_action
 
 
 def scenario(**overrides):
@@ -399,12 +407,23 @@ def test_exit_code_is_non_zero_for_every_kind_of_failure(report, expected):
 # --- the command line ----------------------------------------------------
 
 
-def test_main_validates_the_seed_file_and_is_honest_that_nothing_ran(capsys):
+def test_main_runs_the_evaluation_and_prints_the_four_way_report(capsys):
     assert main([]) == 0
     out = capsys.readouterr().out
-    assert "scenario set is valid" in out
-    assert "nothing was evaluated" in out
-    assert "PASSED" not in out
+    assert "Safety evaluation" in out
+    assert "Scenario failures:" in out and "Known gaps" in out
+    assert "RESULT: PASSED (mutation tests not run)" in out
+    assert "not proof of universal safety" in out
+
+
+def test_main_exits_non_zero_when_a_scenario_fails(tmp_path, capsys):
+    wrong = scenario(expect={"proposal": "none"})
+    path = tmp_path / "wrong.json"
+    path.write_text(json.dumps([wrong]), encoding="utf-8")
+    assert main([str(path)]) == 1
+    out = capsys.readouterr().out
+    assert "RESULT: FAILED" in out
+    assert "expected proposal 'none'" in out
 
 
 def test_main_fails_on_an_invalid_or_missing_file(tmp_path, capsys):
@@ -423,3 +442,346 @@ def test_validation_does_not_mutate_the_scenarios():
     snapshot = copy.deepcopy(original)
     validate_scenarios(original)
     assert original == snapshot
+
+
+# --- S2: the gate layer ---------------------------------------------------
+
+REAL = GateImplementation()
+
+
+def seed(id_):
+    return next(s for s in load_scenarios() if s["id"] == id_)
+
+
+def run(id_, impl=None):
+    return run_gate_scenario(seed(id_), impl)
+
+
+def violated(outcome):
+    return {v.invariant for v in outcome.invariant_violations}
+
+
+def test_the_real_gate_set_passes_every_scenario_and_every_invariant():
+    report = evaluate()
+    assert len(report.scenarios) >= 40
+    assert report.ok and exit_code(report) == 0
+    assert not report.scenario_failures and not report.invariant_failures
+    assert len(report.passed) == len(report.scenarios)
+
+
+def test_the_set_exercises_every_gate_invariant_and_category():
+    scenarios = load_scenarios()
+    for invariant in GATE_INVARIANTS:
+        count = sum(invariant in s["invariants"] for s in scenarios)
+        assert count >= 3, f"{invariant} is declared by only {count} scenarios"
+    gate_categories = {
+        "evidence_gate",
+        "authority_separation",
+        "untrusted_text",
+        "correlation",
+        "finding_integrity",
+    }
+    for category in gate_categories:
+        count = sum(s["category"] == category for s in scenarios)
+        assert count >= 5, f"{category} has only {count} scenarios"
+
+
+def test_every_gate_check_runs_on_every_scenario_not_just_declared_ones():
+    assert set(GATE_CHECKS) == set(GATE_INVARIANTS)
+    seen = []
+    original = dict(GATE_CHECKS)
+    try:
+        for name, check in original.items():
+            GATE_CHECKS[name] = lambda run, n=name, c=check: (seen.append(n), c(run))[1]
+        run_gate_scenario(seed("s018"))
+    finally:
+        GATE_CHECKS.update(original)
+    assert sorted(seen) == sorted(GATE_INVARIANTS)
+
+
+def test_gate_scenarios_are_order_independent():
+    for original in load_scenarios():
+        reversed_scenario = copy.deepcopy(original)
+        reversed_scenario["findings"].reverse()
+        assert run_gate_scenario(reversed_scenario).status == "passed", original["id"]
+
+
+def test_running_a_scenario_twice_gives_the_same_outcome():
+    for original in load_scenarios()[:10]:
+        first, second = run_gate_scenario(original), run_gate_scenario(original)
+        assert first == second
+
+
+def test_validation_rejects_graph_only_invariants_and_bad_risk_levels():
+    with pytest.raises(ScenarioError, match="cannot be checked at the gate layer"):
+        validate_scenarios([scenario(invariants=["G6"])])
+    with pytest.raises(ScenarioError, match="risk_level"):
+        validate_scenarios(
+            [scenario(expect={"proposal": "rollout_restart", "supporting": ["k1"], "risk_level": "spicy"})]
+        )
+    with pytest.raises(ScenarioError, match="needs a proposal"):
+        validate_scenarios([scenario(expect={"proposal": "none", "risk_level": "low"})])
+
+
+def test_expectation_mismatches_are_reported_in_words():
+    bad = scenario(
+        findings=[
+            {"ref": "k1", "agent": "kubernetes", "signals": ["crash_loop"]},
+            {"ref": "k2", "agent": "kubernetes", "signals": ["crash_loop"]},
+        ],
+        expect={
+            "proposal": "rollout_restart",
+            "supporting": ["k1"],
+            "risk_level": "low",
+            "correlations": ["corroborates"],
+        },
+    )
+    outcome = run_gate_scenario(bad)
+    text = " | ".join(outcome.expectation_failures)
+    assert outcome.status == "failed"
+    assert "expected supporting ['k1'], got ['k1', 'k2']" in text
+    assert "expected risk 'low', got 'medium'" in text
+    assert "expected correlations ['corroborates'], got []" in text
+    assert "expected proposal 'none', got 'rollout_restart'" in " | ".join(
+        run_gate_scenario(scenario(expect={"proposal": "none"})).expectation_failures
+    )
+
+
+def test_a_gate_known_gap_reports_what_was_observed_and_flips_if_behavior_changes():
+    gap = scenario(known_gap=known_gap())
+    outcome = run_gate_scenario(gap)
+    assert outcome.status == "known_gap"
+    assert "proposal=rollout_restart, supporting=['k1']" in outcome.observed
+    changed = scenario(known_gap=known_gap(), expect={"proposal": "none"})
+    assert run_gate_scenario(changed).status == "failed"
+
+
+def test_evaluate_rejects_a_malformed_scenario_set():
+    with pytest.raises(ScenarioError):
+        evaluate([scenario(category="vibes")])
+
+
+# --- the evaluation has teeth: injected faults are noticed ----------------
+
+
+def _real_action(id_="s001"):
+    spec = seed(id_)
+    return propose_action(build_incident(spec["incident"]), build_findings(spec).ordered())
+
+
+def _text_based_gate(incident, findings):
+    """The old bug: a gate that reads crash-loop wording instead of the signal."""
+    import re
+
+    for finding in findings:
+        text = " ".join([finding.summary] + [e.observation for e in finding.evidence])
+        if (
+            finding.agent_name == "kubernetes"
+            and is_usable(finding)
+            and re.search(r"crash[\s-]?loop", text, re.IGNORECASE)
+        ):
+            return propose_action(
+                incident, [finding.model_copy(update={"signals": ["crash_loop"]})]
+            )
+    return None
+
+
+def _any_agent_gate(incident, findings):
+    """A gate that lets any specialist's usable finding authorize."""
+    disguised = [
+        f.model_copy(update={"agent_name": "kubernetes", "signals": ["crash_loop"]})
+        for f in findings
+        if is_usable(f)
+    ]
+    return propose_action(incident, disguised)
+
+
+def _ignores_usability_gate(incident, findings):
+    healed = [
+        f.model_copy(
+            update={"status": "completed", "evidence_quality": "limited", "needs_follow_up": False}
+        )
+        for f in findings
+    ]
+    return propose_action(incident, healed)
+
+
+def _with_support(transform):
+    def gate(incident, findings):
+        action = propose_action(incident, findings)
+        return None if action is None else transform(action, findings)
+
+    return gate
+
+
+def test_a_text_reading_gate_fails_scenarios_and_g14():
+    impl = GateImplementation(propose=_text_based_gate)
+    # G14 catches the fault on every untrusted-text scenario, even those
+    # whose own wording does not happen to trigger it, because its poisoned
+    # variant does.
+    for id_ in ("s023", "s024", "s025", "s026", "s027", "s028"):
+        outcome = run(id_, impl)
+        assert outcome.status == "failed", id_
+        assert "G14" in violated(outcome), id_
+    # Where the scenario's own text contains crash-loop wording, the
+    # scenario's expectation fails as well.
+    for id_ in ("s023", "s024", "s025"):
+        outcome = run(id_, impl)
+        assert any("expected proposal 'none'" in f for f in outcome.expectation_failures), id_
+
+
+def test_a_gate_that_lets_any_specialist_authorize_fails_g1_g2_and_g3():
+    impl = GateImplementation(propose=_any_agent_gate)
+    outcome = run("s018", impl)
+    assert outcome.status == "failed"
+    assert {"G1", "G2", "G3"} <= violated(outcome)
+
+
+def test_a_gate_that_ignores_usability_fails_g15_and_g1():
+    impl = GateImplementation(propose=_ignores_usability_gate)
+    for id_ in ("s004", "s013", "s014", "s015"):
+        outcome = run(id_, impl)
+        assert outcome.status == "failed", id_
+        assert {"G1", "G15"} <= violated(outcome), id_
+
+
+def test_repeated_or_foreign_supporting_ids_fail_g2():
+    repeats = GateImplementation(
+        propose=_with_support(
+            lambda a, f: a.model_copy(
+                update={"supporting_finding_ids": a.supporting_finding_ids * 2}
+            )
+        )
+    )
+    assert "G2" in violated(run("s001", repeats))
+    foreign = GateImplementation(
+        propose=_with_support(
+            lambda a, f: a.model_copy(
+                update={
+                    "supporting_finding_ids": a.supporting_finding_ids
+                    + [x.finding_id for x in f if x.agent_name != "kubernetes"]
+                }
+            )
+        )
+    )
+    assert "G2" in violated(run("s006", foreign))
+    empty = GateImplementation(
+        propose=_with_support(lambda a, f: a.model_copy(update={"supporting_finding_ids": []}))
+    )
+    assert "G2" in violated(run("s001", empty))
+
+
+def test_a_non_restart_action_fails_g1():
+    impl = GateImplementation(
+        propose=_with_support(lambda a, f: a.model_copy(update={"action_type": "delete_pod"}))
+    )
+    assert "G1" in violated(run("s001", impl))
+
+
+@pytest.mark.parametrize(
+    "name, annotate",
+    [
+        (
+            "changes the supporting findings",
+            lambda action, correlations, findings: action
+            and action.model_copy(update={"supporting_finding_ids": []}),
+        ),
+        (
+            "changes the risk level",
+            lambda action, correlations, findings: action
+            and action.model_copy(update={"risk_level": "critical"}),
+        ),
+        (
+            "removes the proposal",
+            lambda action, correlations, findings: None,
+        ),
+        (
+            "rewrites the rationale",
+            lambda action, correlations, findings: action
+            and action.model_copy(update={"rationale": "something else entirely"}),
+        ),
+    ],
+)
+def test_annotation_that_changes_more_than_the_text_fails_g4(name, annotate):
+    outcome = run("s006", GateImplementation(annotate=annotate))
+    assert "G4" in violated(outcome), name
+
+
+def test_annotation_that_creates_a_proposal_fails_g4():
+    fabricated = _real_action()
+    impl = GateImplementation(
+        annotate=lambda action, correlations, findings: action or fabricated
+    )
+    outcome = run("s018", impl)
+    assert "G4" in violated(outcome)
+
+
+def test_correlation_over_unusable_or_single_specialist_findings_fails_g5():
+    from app.state.models import Correlation
+
+    def bad(rule_ids):
+        def correlator(findings, now=None):
+            return [
+                Correlation(
+                    kind="corroborates",
+                    rule="faulty",
+                    finding_ids=rule_ids(findings),
+                    explanation="Faulty correlation for the test.",
+                    correlated_at=now,
+                )
+            ]
+
+        return correlator
+
+    partial = GateImplementation(correlate=bad(lambda f: [x.finding_id for x in f][:2]))
+    assert "G5" in violated(run("s034", partial))  # includes the partial finding
+    same_specialist = GateImplementation(
+        correlate=bad(lambda f: [x.finding_id for x in f][:2])
+    )
+    assert "G5" in violated(run("s016", same_specialist))  # two Kubernetes findings
+    unknown = GateImplementation(correlate=bad(lambda f: ["ghost-1", "ghost-2"]))
+    assert "G5" in violated(run("s001", unknown))
+
+
+def test_the_g12_check_notices_foreign_signals_and_signals_on_failed_findings():
+    built = build_findings(seed("s001"))
+    good = built.findings["k1"]
+    foreign = good.model_copy(update={"agent_name": "observability"})  # bypasses validation
+    run_ = GateRun(
+        incident=build_incident({}),
+        built=BuiltFindings({"x": foreign}, []),
+        action=None,
+        correlations=[],
+        annotated=None,
+        impl=REAL,
+    )
+    assert any("may not emit" in m for m in GATE_CHECKS["G12"](run_))
+    failed = good.model_copy(update={"status": "failed"})
+    run_.built = BuiltFindings({"x": failed}, [])
+    assert any("failed but carries" in m for m in GATE_CHECKS["G12"](run_))
+
+
+def test_the_g14_variants_keep_structure_and_change_only_text():
+    from app.evaluate_safety import _POISON, _with_text
+
+    original = build_findings(seed("s029")).findings["k1"]
+    for text in (None, _POISON):
+        variant = _with_text(original, text)
+        assert variant.finding_id == original.finding_id
+        assert (variant.agent_name, variant.status, variant.signals, variant.evidence_quality) == (
+            original.agent_name,
+            original.status,
+            original.signals,
+            original.evidence_quality,
+        )
+        assert [e.source_tool for e in variant.evidence] == [
+            e.source_tool for e in original.evidence
+        ]
+        assert variant.summary != original.summary
+    assert _with_text(original, _POISON).error_message == _POISON
+    assert _with_text(original, None).error_message is None
+
+
+def test_the_real_functions_pass_the_same_scenarios_the_faults_fail():
+    for id_ in ("s018", "s023", "s004", "s006", "s034", "s016", "s001"):
+        assert run(id_).status == "passed", id_
