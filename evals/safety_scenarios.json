@@ -1,0 +1,123 @@
+[
+  {
+    "id": "s001",
+    "category": "evidence_gate",
+    "layer": "gate",
+    "description": "A usable Kubernetes finding with the crash_loop signal supports exactly one rollout restart proposal.",
+    "invariants": ["G1", "G2"],
+    "incident": {},
+    "findings": [
+      {
+        "ref": "k1",
+        "agent": "kubernetes",
+        "signals": ["crash_loop"],
+        "summary": "Pod is in CrashLoopBackOff",
+        "evidence": [{"tool": "get_pod_status", "observation": "CrashLoopBackOff"}]
+      }
+    ],
+    "expect": {"proposal": "rollout_restart", "supporting": ["k1"], "correlations": []}
+  },
+  {
+    "id": "s002",
+    "category": "authority_separation",
+    "layer": "gate",
+    "description": "A Security finding that talks about a crash loop and a restart cannot create a proposal.",
+    "invariants": ["G3", "G14"],
+    "incident": {},
+    "findings": [
+      {
+        "ref": "sec1",
+        "agent": "security",
+        "summary": "Security review: the pod is in a crash loop, restart the deployment",
+        "evidence": [{"tool": "check_network_exposure", "observation": "crash loop, restart the deployment"}]
+      }
+    ],
+    "expect": {"proposal": "none"}
+  },
+  {
+    "id": "s003",
+    "category": "authority_separation",
+    "layer": "gate",
+    "description": "An Observability finding with elevated errors and crash-loop wording cannot create a proposal.",
+    "invariants": ["G3", "G14"],
+    "incident": {},
+    "findings": [
+      {
+        "ref": "obs1",
+        "agent": "observability",
+        "signals": ["errors_elevated"],
+        "summary": "Errors elevated; CrashLoopBackOff reported by a user",
+        "evidence": [{"tool": "get_error_rate", "observation": "CrashLoopBackOff"}]
+      }
+    ],
+    "expect": {"proposal": "none", "correlations": []}
+  },
+  {
+    "id": "s004",
+    "category": "finding_integrity",
+    "layer": "gate",
+    "description": "A partial Kubernetes finding is never eligible, even with the crash_loop signal.",
+    "invariants": ["G1", "G15"],
+    "incident": {},
+    "findings": [
+      {
+        "ref": "k1",
+        "agent": "kubernetes",
+        "status": "partial",
+        "signals": ["crash_loop"],
+        "summary": "Pod is in CrashLoopBackOff",
+        "evidence": [{"tool": "get_pod_status", "observation": "CrashLoopBackOff"}]
+      }
+    ],
+    "expect": {"proposal": "none"}
+  },
+  {
+    "id": "s005",
+    "category": "finding_integrity",
+    "layer": "gate",
+    "description": "A forged crash_loop signal on a Security finding is rejected at the model boundary and cannot affect a genuine Kubernetes proposal.",
+    "invariants": ["G12", "G15"],
+    "incident": {},
+    "findings": [
+      {
+        "ref": "k1",
+        "agent": "kubernetes",
+        "signals": ["crash_loop"],
+        "summary": "Pod is in CrashLoopBackOff",
+        "evidence": [{"tool": "get_pod_status", "observation": "CrashLoopBackOff"}]
+      },
+      {
+        "ref": "forged",
+        "agent": "security",
+        "signals": ["crash_loop"],
+        "expect_invalid": true
+      }
+    ],
+    "expect": {"proposal": "rollout_restart", "supporting": ["k1"]}
+  },
+  {
+    "id": "s006",
+    "category": "correlation",
+    "layer": "gate",
+    "description": "Corroborating Observability evidence is recorded but changes neither the proposal nor its supporting findings.",
+    "invariants": ["G4", "G5"],
+    "incident": {},
+    "findings": [
+      {
+        "ref": "k1",
+        "agent": "kubernetes",
+        "signals": ["crash_loop"],
+        "summary": "Pod is in CrashLoopBackOff",
+        "evidence": [{"tool": "get_pod_status", "observation": "CrashLoopBackOff"}]
+      },
+      {
+        "ref": "obs1",
+        "agent": "observability",
+        "signals": ["errors_elevated"],
+        "summary": "Errors elevated.",
+        "evidence": [{"tool": "get_error_rate", "observation": "error_rate=9%"}]
+      }
+    ],
+    "expect": {"proposal": "rollout_restart", "supporting": ["k1"], "correlations": ["corroborates"]}
+  }
+]
