@@ -95,6 +95,16 @@ def obs(*signals, **kw):
     return finding("observability", signals, **kw)
 
 
+def obs_complete(*signals, **kw):
+    """An Observability finding with evidence from all three checks."""
+    kw["evidence"] = [
+        evidence("error_rate=1%", "get_error_rate"),
+        evidence("latency p95=100ms p99=200ms", "get_latency_percentiles"),
+        evidence("cpu=10% memory=20%", "get_resource_usage"),
+    ]
+    return finding("observability", signals, **kw)
+
+
 def sec(*signals, **kw):
     return finding("security", signals, **kw)
 
@@ -142,7 +152,7 @@ def test_r1_explanation_states_a_shared_hypothesis_not_proof():
 
 
 def test_c1_fires_for_a_fully_completed_clean_observability_finding():
-    kubernetes, observability = k_crash(), obs()
+    kubernetes, observability = k_crash(), obs_complete()
     (result,) = correlate([kubernetes, observability], now=NOW)
     assert result.kind == "contradicts"
     assert result.rule == corr.RULE_IMPACT_NOT_OBSERVED
@@ -175,12 +185,60 @@ def test_c1_never_fires_unless_every_check_completed(observability):
     assert correlate([k_crash(), observability], now=NOW) == []
 
 
+_ERROR = "get_error_rate"
+_LATENCY = "get_latency_percentiles"
+_RESOURCES = "get_resource_usage"
+
+
+@pytest.mark.parametrize(
+    "tools",
+    [
+        ["some_other_tool"],
+        [_ERROR],
+        [_ERROR, _LATENCY],
+        [_ERROR, _LATENCY, _RESOURCES, _RESOURCES],
+        [_ERROR, _ERROR, _RESOURCES],
+        [_ERROR, _LATENCY, "some_other_tool"],
+    ],
+)
+def test_c1_needs_evidence_from_exactly_the_three_required_checks(tools):
+    # Status "completed" and no signals is not enough on its own.
+    incomplete = obs(evidence=[evidence("ok", tool) for tool in tools])
+    assert correlate([k_crash(), incomplete], now=NOW) == []
+
+
+def test_c1_accepts_the_required_checks_in_any_order():
+    reordered = obs(
+        evidence=[
+            evidence("cpu=10%", "get_resource_usage"),
+            evidence("error_rate=1%", "get_error_rate"),
+            evidence("p95=100ms", "get_latency_percentiles"),
+        ]
+    )
+    (result,) = correlate([k_crash(), reordered], now=NOW)
+    assert result.kind == "contradicts"
+
+
+def test_c1_relies_on_the_specialists_own_list_of_required_checks():
+    from app.supervisor import observability
+
+    assert (
+        corr.OBSERVABILITY_REQUIRED_CHECKS
+        is observability.OBSERVABILITY_REQUIRED_CHECKS
+    )
+    assert corr.OBSERVABILITY_REQUIRED_CHECKS == {
+        "get_error_rate",
+        "get_latency_percentiles",
+        "get_resource_usage",
+    }
+
+
 def test_c1_does_not_fire_when_observability_has_resource_signals_only():
     assert correlate([k_crash(), obs("cpu_saturated")], now=NOW) == []
 
 
 def test_c1_needs_a_kubernetes_crash_loop_signal():
-    assert correlate([k_healthy(), obs()], now=NOW) == []
+    assert correlate([k_healthy(), obs_complete()], now=NOW) == []
 
 
 # --- R2: co_occurs -------------------------------------------------------
@@ -384,7 +442,7 @@ def test_only_the_latest_attempt_per_specialist_counts():
         == []
     )
     elevated_first = obs("errors_elevated", attempt=1)
-    clean_retry = obs(attempt=2)
+    clean_retry = obs_complete(attempt=2)
     (result,) = correlate([k_crash(), elevated_first, clean_retry], now=NOW)
     assert result.kind == "contradicts"
     assert result.finding_ids[1] == clean_retry.finding_id
@@ -397,7 +455,7 @@ def _all_explanations():
     fired = {}
     scenarios = [
         [k_crash(), obs("errors_elevated", "latency_elevated")],
-        [k_crash(), obs()],
+        [k_crash(), obs_complete()],
         [obs("latency_elevated", "cpu_saturated"), sec("failed_auth_elevated")],
     ]
     for findings in scenarios:
@@ -444,7 +502,7 @@ def test_effective_quality_reads_corroborated_for_a_corroborated_finding():
 
 
 def test_effective_quality_ignores_contradicts_and_co_occurs():
-    kubernetes, clean = k_crash(), obs()
+    kubernetes, clean = k_crash(), obs_complete()
     contradicts = correlate([kubernetes, clean], now=NOW)
     assert contradicts[0].kind == "contradicts"
     assert effective_quality(kubernetes, contradicts) == "limited"

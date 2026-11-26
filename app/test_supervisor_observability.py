@@ -482,3 +482,22 @@ def test_signals_and_summary_always_agree():
                 if text.lower() in summary
             }
             assert set(finding.signals) == named
+
+
+# --- required checks (relied on by correlation rule C1) ------------------
+
+
+def test_required_checks_match_the_sequence_and_the_allowlist():
+    assert obs.OBSERVABILITY_REQUIRED_CHECKS == set(obs._SEQUENCE)
+    assert obs.OBSERVABILITY_REQUIRED_CHECKS == obs.OBSERVABILITY_TOOL_ALLOWLIST
+
+
+@pytest.mark.parametrize(
+    "service", ["payment-api", "inventory-api", "checkout-api"]
+)
+def test_a_completed_finding_has_evidence_from_exactly_the_required_checks(service):
+    finding = collect(server_backend(), service=service)
+    tools = [item.source_tool for item in finding.evidence]
+    assert finding.status == "completed"
+    assert len(tools) == len(obs.OBSERVABILITY_REQUIRED_CHECKS)
+    assert set(tools) == obs.OBSERVABILITY_REQUIRED_CHECKS

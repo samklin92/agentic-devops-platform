@@ -34,6 +34,7 @@ from app.state.models import (
     ProposedAction,
     utc_now,
 )
+from app.supervisor.observability import OBSERVABILITY_REQUIRED_CHECKS
 from app.supervisor.proposals import is_usable
 
 RULE_SHARED_IMPACT = "shared_incident_impact"
@@ -83,9 +84,21 @@ def _current_findings(findings: Iterable[Finding]) -> dict[str, Finding]:
 
 
 def _completed_without_failed_runs(finding: Finding) -> bool:
-    """True only if every check of the finding ran successfully."""
-    return finding.status == "completed" and not any(
-        is_execution_failure(item.observation) for item in finding.evidence
+    """True only if all three required Observability checks succeeded.
+
+    The evidence must cover exactly the required checks, once each, and
+    none of it may be a failed run. A finding that merely says
+    "completed" is not enough.
+    """
+    tools = [item.source_tool for item in finding.evidence]
+    return (
+        finding.status == "completed"
+        and len(tools) == len(OBSERVABILITY_REQUIRED_CHECKS)
+        and set(tools) == OBSERVABILITY_REQUIRED_CHECKS
+        and not any(
+            is_execution_failure(item.observation)
+            for item in finding.evidence
+        )
     )
 
 

@@ -61,13 +61,16 @@ TOOL_ERROR_RATE = "get_error_rate"
 TOOL_LATENCY = "get_latency_percentiles"
 TOOL_RESOURCES = "get_resource_usage"
 
-# The only MCP tools the Observability agent may ever call. All read-only.
-OBSERVABILITY_TOOL_ALLOWLIST: frozenset[str] = frozenset(
-    {TOOL_ERROR_RATE, TOOL_LATENCY, TOOL_RESOURCES}
-)
-
 # Fixed order. The investigation is exactly these three calls.
 _SEQUENCE = (TOOL_ERROR_RATE, TOOL_LATENCY, TOOL_RESOURCES)
+
+# The only MCP tools the Observability agent may ever call. All read-only.
+OBSERVABILITY_TOOL_ALLOWLIST: frozenset[str] = frozenset(_SEQUENCE)
+
+# A complete Observability investigation has evidence from exactly these
+# three checks. The Supervisor relies on this before it treats a finding
+# with no signals as "metrics looked normal" (correlation rule C1).
+OBSERVABILITY_REQUIRED_CHECKS: frozenset[str] = frozenset(_SEQUENCE)
 
 _REQUIRED_FIELDS = {
     TOOL_ERROR_RATE: ("error_rate_pct",),

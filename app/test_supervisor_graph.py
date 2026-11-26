@@ -376,7 +376,20 @@ def test_corroboration_is_recorded_without_changing_the_proposal(db_path, tmp_pa
 
 def test_a_contradiction_is_shown_but_does_not_block_the_proposal(db_path):
     kubernetes = kubernetes_crash()
-    clean = signalled("observability", summary="Metrics within normal thresholds.")
+    clean = Finding(
+        agent_name="observability",
+        summary="Metrics within normal thresholds.",
+        evidence=[
+            AgentEvidence(source_tool="get_error_rate", observation="normal"),
+            AgentEvidence(
+                source_tool="get_latency_percentiles", observation="normal"
+            ),
+            AgentEvidence(
+                source_tool="get_resource_usage", observation="normal"
+            ),
+        ],
+        evidence_quality="limited",
+    )
     incident = make_incident(description=CORROBORATED_INCIDENT)
 
     _, snapshot = run(

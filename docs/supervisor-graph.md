@@ -104,13 +104,14 @@ different specialists:
 | Rule | Condition | Kind |
 |---|---|---|
 | R1 `shared_incident_impact` | Kubernetes `crash_loop` and Observability `errors_elevated` or `latency_elevated` | `corroborates` |
-| C1 `impact_not_observed` | Kubernetes `crash_loop` and an Observability finding that completed every check, with no failed-run observations and no signals | `contradicts` |
+| C1 `impact_not_observed` | Kubernetes `crash_loop` and an Observability finding with no signals whose evidence covers exactly the three required checks (error rate, latency, resource usage) with no failed-run observations | `contradicts` |
 | R2 `load_with_failed_auth` | Observability `latency_elevated` or `cpu_saturated` and Security `failed_auth_elevated` | `co_occurs` |
 
 R1 says independent specialists support a shared incident-impact
 hypothesis and states that this does not establish the cause of the crash
 loop. C1 never fires on a partial, failed or unfinished Observability
-investigation. R2 says co-occurrence does not establish causation and
+investigation, or on a finding that only claims to be complete without
+evidence from all three checks. R2 says co-occurrence does not establish causation and
 implies no remediation, and it is never a corroboration. Explanations are
 built from signal names and fixed caveats, and tests reject causal and
 remediation wording.
