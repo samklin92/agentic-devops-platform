@@ -2,7 +2,7 @@
 
 import pytest
 
-from app.state.signals import CRASH_LOOP_PATTERN, mentions_crash_loop
+from app.state.signals import CRASH_LOOP_SIGNAL, mentions_crash_loop
 from app.supervisor import proposals
 
 
@@ -28,6 +28,10 @@ def test_other_text_is_not_a_crash_loop(text):
     assert not mentions_crash_loop(text)
 
 
-def test_the_proposal_gate_uses_the_same_pattern_object():
-    # One source of truth: the gate and the Kubernetes signal cannot drift.
-    assert proposals._CRASH_LOOP is CRASH_LOOP_PATTERN
+def test_the_gate_names_the_signal_from_the_shared_module_and_reads_no_text():
+    # One source of truth for the signal name. The gate requires that
+    # structured signal and has no text pattern of its own.
+    assert CRASH_LOOP_SIGNAL == "crash_loop"
+    assert proposals.CRASH_LOOP_SIGNAL is CRASH_LOOP_SIGNAL
+    assert not hasattr(proposals, "_CRASH_LOOP")
+    assert not hasattr(proposals, "_finding_text")

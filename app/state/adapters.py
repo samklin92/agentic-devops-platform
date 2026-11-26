@@ -4,7 +4,7 @@ import json
 
 from app.contracts.agent_messages import KubernetesInvestigationResponse
 from app.state.models import Finding
-from app.state.signals import mentions_crash_loop
+from app.state.signals import CRASH_LOOP_SIGNAL, mentions_crash_loop
 
 MAX_SUMMARY_CHARS = 500
 
@@ -51,7 +51,7 @@ def finding_from_kubernetes_response(
             + [item.observation for item in diagnostic]
         )
         if mentions_crash_loop(signal_text):
-            signals.append("crash_loop")
+            signals.append(CRASH_LOOP_SIGNAL)
 
     return Finding(
         agent_name="kubernetes",

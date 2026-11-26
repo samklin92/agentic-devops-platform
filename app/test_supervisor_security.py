@@ -494,6 +494,7 @@ def finding_mentioning_crash_loop(agent_name, **overrides):
             )
         ],
         "evidence_quality": "limited",
+        "signals": ["crash_loop"] if agent_name == "kubernetes" else [],
     }
     data.update(overrides)
     return Finding(**data)

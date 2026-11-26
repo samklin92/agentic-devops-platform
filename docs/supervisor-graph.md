@@ -62,8 +62,11 @@ the same description still routes to Kubernetes.
 
 - A finding is usable only if its status is `completed`, its evidence
   quality is above `insufficient`, and it needs no follow-up.
-- A proposal needs a usable Kubernetes finding whose text shows a crash
-  loop, and an incident that names a namespace and a deployment.
+- A proposal needs a usable Kubernetes finding that carries the
+  structured `crash_loop` signal, and an incident that names a namespace
+  and a deployment. The gate never reads summaries, evidence text or
+  error messages, so untrusted text cannot create a proposal, and a
+  missing signal means no proposal (it fails closed).
 - The only proposal today is `rollout_restart` on
   `deployment/<name>`. Risk is `medium` in production and `low`
   elsewhere.
@@ -94,9 +97,9 @@ signals at all (the `Finding` model rejects it). Observability and
 Security build their summary text from the same signals, so text and
 signals cannot disagree. Kubernetes gets `crash_loop` only from a
 successful diagnostic observation and the agent's findings, never from an
-error message or a failed tool run, using the same pattern as the
-proposal gate (`app/state/signals.py`), so there is one definition of a
-crash loop.
+error message or a failed tool run. The pattern and the signal name live
+in `app/state/signals.py`. The proposal gate requires the resulting
+structured signal and reads no text itself.
 
 **Rules.** Only usable findings take part, and every relation needs two
 different specialists:
@@ -326,7 +329,8 @@ metrics and security groups is tested in `test_mcp_server`.
 | Co-occurrence is never read as corroboration or causation | R2 kind and caveat | `test_supervisor_correlation`, `test_supervisor_graph` |
 | Correlations are recomputed, never accumulated | `correlate` node | `test_supervisor_graph`, `test_supervisor_correlation` |
 | Checkpoints from before correlations existed still resume | `current_correlations` tolerates a missing field | `test_supervisor_graph` |
-| One definition of a crash loop | `app/state/signals.py` | `test_state_signals`, `test_platform_state` |
+| Untrusted text cannot create a proposal: the gate requires the structured `crash_loop` signal and reads no text | `propose_action` | `test_supervisor_components` (text-only cases), `test_supervisor_security`, `test_supervisor_observability` |
+| One definition of the `crash_loop` signal name and its detection | `app/state/signals.py` | `test_state_signals`, `test_platform_state` |
 | An incomplete metrics picture is not usable evidence | `is_usable` requires `completed` | `test_supervisor_observability`, `test_supervisor_stdio_integration` (unknown service) |
 | A specialist does not run again on resume | Checkpoint written after the `investigate` node | `test_supervisor_graph`, `test_supervisor_stdio_integration` |
 
@@ -373,12 +377,14 @@ metrics and security groups is tested in `test_mcp_server`.
   coexist with one crash-looping replica. It is shown to the approver and
   never blocks a proposal. There is no veto, and no loop yet that would
   ask a specialist for more evidence when findings disagree.
-- The proposal gate searches all evidence text, including failed-run
-  observations, while the Kubernetes `crash_loop` signal ignores them. A
-  failed run whose error text contained "crash loop" could therefore
-  satisfy the gate without producing the signal. The effect is safe (no
-  annotation, never an extra proposal), and both could be tightened
-  together later.
+- The Kubernetes adapter derives the `crash_loop` signal from successful
+  diagnostic output with a text pattern that does not understand
+  negation. Successful diagnostic text such as "no crash loop detected"
+  would still set the signal, and the gate, which requires that signal,
+  would then propose. The gate itself reads no text, and a failed tool
+  run or an error message can never set the signal. A follow-up should
+  derive the signal from the tool's structured pod-status field instead
+  of from text.
 - Only a crash loop produces a proposal. Other failure types (image pull
   errors, OOM kills) investigate but propose nothing.
 - Deployment name: the MCP adapter passes the pod name as the deployment

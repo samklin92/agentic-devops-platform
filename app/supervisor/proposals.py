@@ -6,7 +6,7 @@ from app.state.models import (
     ProposedAction,
     RiskLevel,
 )
-from app.state.signals import CRASH_LOOP_PATTERN as _CRASH_LOOP
+from app.state.signals import CRASH_LOOP_SIGNAL
 
 _PRODUCTION = {"production", "prod"}
 
@@ -20,16 +20,17 @@ def is_usable(finding: Finding) -> bool:
     )
 
 
-def _finding_text(finding: Finding) -> str:
-    parts = [finding.summary] + [e.observation for e in finding.evidence]
-    return " ".join(parts)
-
-
 def propose_action(
     incident: IncidentContext,
     findings: list[Finding],
 ) -> ProposedAction | None:
-    """Return a proposal if the evidence supports one, otherwise None."""
+    """Return a proposal if the evidence supports one, otherwise None.
+
+    The gate decides on structured, validated evidence only. A Kubernetes
+    finding must be usable and carry the `crash_loop` signal. Summaries,
+    evidence text and error messages are never read, so untrusted text
+    cannot create a proposal. Anything short of that fails closed.
+    """
     if not incident.namespace or not incident.deployment:
         return None
 
@@ -38,7 +39,7 @@ def propose_action(
         for finding in findings
         if finding.agent_name == "kubernetes"
         and is_usable(finding)
-        and _CRASH_LOOP.search(_finding_text(finding))
+        and CRASH_LOOP_SIGNAL in finding.signals
     ]
     if not supporting:
         return None

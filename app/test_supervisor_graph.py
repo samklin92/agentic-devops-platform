@@ -45,6 +45,7 @@ def crash_loop_finding() -> Finding:
             ),
         ],
         evidence_quality="corroborated",
+        signals=["crash_loop"],
     )
 
 

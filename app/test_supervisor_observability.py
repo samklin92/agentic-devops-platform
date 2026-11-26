@@ -342,6 +342,7 @@ def finding_mentioning_crash_loop(agent_name):
             AgentEvidence(source_tool="some_tool", observation="crash loop")
         ],
         evidence_quality="limited",
+        signals=["crash_loop"] if agent_name == "kubernetes" else [],
     )
 
 
