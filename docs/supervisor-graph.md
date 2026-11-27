@@ -350,6 +350,7 @@ metrics and security groups is tested in `test_mcp_server`.
 | One definition of the `crash_loop` signal name and its detection | `app/state/signals.py` | `test_state_signals`, `test_platform_state` |
 | The gate and correlation use the same current findings: latest attempt per specialist, duplicates collapsed, ambiguous specialists excluded | `current_findings` in `app/supervisor/current_findings.py` | `test_supervisor_current_findings`, `test_supervisor_correlation`, safety eval s016, s017, s043 to s047 |
 | A superseded or ambiguous finding never supports a proposal or a correlation | `propose_action` and `correlate` both read only `current_findings` | `test_supervisor_current_findings`, `test_supervisor_components`, `test_supervisor_correlation`, safety eval s043 to s047 |
+| The safety evaluation can fail: each of twelve injected faults is detected | `app/safety_mutations.py` | `test_safety_mutations`, `python -m app.evaluate_safety --mutations` |
 | An incomplete metrics picture is not usable evidence | `is_usable` requires `completed` | `test_supervisor_observability`, `test_supervisor_stdio_integration` (unknown service) |
 | A specialist does not run again on resume | Checkpoint written after the `investigate` node | `test_supervisor_graph`, `test_supervisor_stdio_integration` |
 
@@ -360,8 +361,15 @@ metrics and security groups is tested in `test_mcp_server`.
 `test_supervisor_correlation`, `test_supervisor_current_findings`,
 `test_state_signals`,
 `test_supervisor_kubernetes_integration`, `test_supervisor_mcp_tools`, `test_supervisor_observability`,
-`test_supervisor_security`, `test_mcp_server` and
-`test_supervisor_stdio_integration`, all under `app/`.
+`test_supervisor_security`, `test_mcp_server`,
+`test_supervisor_stdio_integration`, `test_safety_eval`,
+`test_safety_eval_graph` and `test_safety_mutations`, all under `app/`.
+
+The last three cover the safety evaluation, which drives the real gate
+and the real compiled graph against 65 scenarios and 15 invariants, and
+injects 12 faults that it must detect. Run it with
+`python -m app.evaluate_safety` (add `--mutations` for the fault
+injection). See `docs/safety-eval.md`.
 
 ## Running
 
@@ -421,6 +429,12 @@ metrics and security groups is tested in `test_mcp_server`.
   must validate every decision with `parse_decision` before it resumes
   the graph, and log rejected attempts itself. A bounded re-interrupt
   loop that records each rejected attempt is an option to revisit then.
+- The safety evaluation's fault injection cannot express structural
+  faults in the graph's routing, such as an edge from `evaluate` to
+  `execute`, because the conditional edges are closures inside
+  `build_supervisor_graph`. No execution without approval is enforced by
+  those edges and covered by scenarios, but not by an injected edge
+  fault. See `docs/safety-eval.md`.
 - Only a crash loop produces a proposal. Other failure types (image pull
   errors, OOM kills) investigate but propose nothing.
 - Deployment name: the MCP adapter passes the pod name as the deployment
@@ -435,6 +449,11 @@ metrics and security groups is tested in `test_mcp_server`.
 - Routing is rule-based and misses incidents without known keywords.
 - There is no loop yet for requesting more evidence, so
   `supervisor_hops_exhausted` is defined but not used by the graph.
+  `max_supervisor_hops` is counted but never enforced: no run can exceed
+  it, and a run with a ceiling of 3 still uses 5 hops. The safety
+  evaluation reports this as a known gap (`s118`) and fails if the
+  behavior changes. Phase 2, which adds loops, must make enforcement a
+  required property.
 - No LLM call is made anywhere in the Supervisor path, so usage and cost
   attribution are not exercised.
 - `app/mcp_server/client.py` is a stale demo: it starts the server with a
