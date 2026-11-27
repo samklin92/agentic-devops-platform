@@ -7,6 +7,7 @@ from app.state.models import (
     RiskLevel,
 )
 from app.state.signals import CRASH_LOOP_SIGNAL
+from app.supervisor.current_findings import current_findings
 
 _PRODUCTION = {"production", "prod"}
 
@@ -26,22 +27,23 @@ def propose_action(
 ) -> ProposedAction | None:
     """Return a proposal if the evidence supports one, otherwise None.
 
-    The gate decides on structured, validated evidence only. A Kubernetes
-    finding must be usable and carry the `crash_loop` signal. Summaries,
-    evidence text and error messages are never read, so untrusted text
-    cannot create a proposal. Anything short of that fails closed.
+    The gate decides on structured, validated evidence only, and only on
+    the CURRENT Kubernetes finding (see `current_findings`): the latest
+    attempt, never a superseded one, and never a specialist whose records
+    are ambiguous. That finding must be usable and carry the `crash_loop`
+    signal. Summaries, evidence text and error messages are never read, so
+    untrusted text cannot create a proposal. Anything short of that fails
+    closed.
     """
     if not incident.namespace or not incident.deployment:
         return None
 
-    supporting = [
-        finding
-        for finding in findings
-        if finding.agent_name == "kubernetes"
-        and is_usable(finding)
-        and CRASH_LOOP_SIGNAL in finding.signals
-    ]
-    if not supporting:
+    kubernetes = current_findings(findings).get("kubernetes")
+    if (
+        kubernetes is None
+        or not is_usable(kubernetes)
+        or CRASH_LOOP_SIGNAL not in kubernetes.signals
+    ):
         return None
 
     risk: RiskLevel = (
@@ -56,5 +58,5 @@ def propose_action(
             "proposed for human review."
         ),
         risk_level=risk,
-        supporting_finding_ids=[f.finding_id for f in supporting],
+        supporting_finding_ids=[kubernetes.finding_id],
     )

@@ -67,6 +67,16 @@ the same description still routes to Kubernetes.
   and a deployment. The gate never reads summaries, evidence text or
   error messages, so untrusted text cannot create a proposal, and a
   missing signal means no proposal (it fails closed).
+- The gate evaluates only the current findings, chosen by
+  `current_findings` (`app/supervisor/current_findings.py`), the same
+  function correlation uses: the latest attempt per specialist, exact
+  duplicate records collapsed, and a specialist excluded entirely when
+  its records are ambiguous (one finding ID on two different records,
+  or two different records at the same attempt). An excluded
+  specialist has no current finding, and no earlier or later attempt
+  is salvaged, so the gate fails closed. A superseded attempt cannot
+  support a proposal, and a proposal names exactly one supporting
+  finding.
 - The only proposal today is `rollout_restart` on
   `deployment/<name>`. Risk is `medium` in production and `low`
   elsewhere.
@@ -120,10 +130,11 @@ built from signal names and fixed caveats, and tests reject causal and
 remediation wording.
 
 **How the result is computed.** `correlate(findings)` is pure and
-deterministic. It looks only at the latest attempt per specialist, leaves
-out a specialist whose finding ID is ambiguous (the same ID on two
-different records), and gives the same correlations, with the same IDs,
-in any input order. The `correlate` node recomputes the whole list from
+deterministic. It uses `current_findings`, the same selection as the
+proposal gate: the latest attempt per specialist, with a specialist
+left out when its records are ambiguous (the same ID on two different
+records, or two different records at one attempt). It gives the same
+correlations, with the same IDs, in any input order. The `correlate` node recomputes the whole list from
 the current findings each time and replaces `PlatformState.correlations`,
 so a repeated investigation cannot leave stale relationships. It writes
 one `correlation_recorded` audit entry per correlation.
@@ -138,8 +149,8 @@ gate never uses it.
 
 **What it may not do.** Create a proposal, remove one, change its risk
 level or its supporting finding IDs, authorize execution or override the
-human decision. `propose_action(incident, findings)` is unchanged and
-takes no correlations. Tests compare proposals with and without
+human decision. `propose_action(incident, findings)` takes no
+correlations. Tests compare proposals with and without
 correlations across many finding combinations, and the only permitted
 difference is the rationale text.
 
@@ -323,7 +334,7 @@ metrics and security groups is tested in `test_mcp_server`.
 | Security findings never authorize or support remediation | `propose_action` filters on the Kubernetes agent | `test_supervisor_security` (gate tests), `test_supervisor_stdio_integration` (mixed incident) |
 | Tool output cannot inject text into a Security finding | Evidence built from validated numbers and booleans | `test_supervisor_security` |
 | A missing target is an error or `blocked`, never a clean result | Server returns `error`; `blocked` and `failed` findings | `test_mcp_server`, `test_supervisor_security`, `test_supervisor_stdio_integration` |
-| Correlation never changes whether a proposal exists, its risk or its supporting findings | `propose_action` is unchanged; `annotate_action` only extends rationale text and returns `None` for `None` | `test_supervisor_correlation` (combination test), `test_supervisor_graph`, `test_supervisor_stdio_integration` |
+| Correlation never changes whether a proposal exists, its risk or its supporting findings | `propose_action` takes no correlations; `annotate_action` only extends rationale text and returns `None` for `None` | `test_supervisor_correlation` (combination test), `test_supervisor_graph`, `test_supervisor_stdio_integration` |
 | Only usable findings from two different specialists correlate | `correlate` | `test_supervisor_correlation` |
 | Signals come only from checks that succeeded | Specialist `_signals`, `Finding` validator, Kubernetes adapter | `test_supervisor_observability`, `test_supervisor_security`, `test_platform_state`, `test_state_models` |
 | Co-occurrence is never read as corroboration or causation | R2 kind and caveat | `test_supervisor_correlation`, `test_supervisor_graph` |
@@ -331,6 +342,8 @@ metrics and security groups is tested in `test_mcp_server`.
 | Checkpoints from before correlations existed still resume | `current_correlations` tolerates a missing field | `test_supervisor_graph` |
 | Untrusted text cannot create a proposal: the gate requires the structured `crash_loop` signal and reads no text | `propose_action` | `test_supervisor_components` (text-only cases), `test_supervisor_security`, `test_supervisor_observability` |
 | One definition of the `crash_loop` signal name and its detection | `app/state/signals.py` | `test_state_signals`, `test_platform_state` |
+| The gate and correlation use the same current findings: latest attempt per specialist, duplicates collapsed, ambiguous specialists excluded | `current_findings` in `app/supervisor/current_findings.py` | `test_supervisor_current_findings`, `test_supervisor_correlation`, safety eval s016, s017, s043 to s047 |
+| A superseded or ambiguous finding never supports a proposal or a correlation | `propose_action` and `correlate` both read only `current_findings` | `test_supervisor_current_findings`, `test_supervisor_components`, `test_supervisor_correlation`, safety eval s043 to s047 |
 | An incomplete metrics picture is not usable evidence | `is_usable` requires `completed` | `test_supervisor_observability`, `test_supervisor_stdio_integration` (unknown service) |
 | A specialist does not run again on resume | Checkpoint written after the `investigate` node | `test_supervisor_graph`, `test_supervisor_stdio_integration` |
 
@@ -338,7 +351,8 @@ metrics and security groups is tested in `test_mcp_server`.
 
 `test_supervisor_routing`, `test_routing_eval`,
 `test_supervisor_components`, `test_supervisor_graph`,
-`test_supervisor_correlation`, `test_state_signals`,
+`test_supervisor_correlation`, `test_supervisor_current_findings`,
+`test_state_signals`,
 `test_supervisor_kubernetes_integration`, `test_supervisor_mcp_tools`, `test_supervisor_observability`,
 `test_supervisor_security`, `test_mcp_server` and
 `test_supervisor_stdio_integration`, all under `app/`.
@@ -385,6 +399,12 @@ metrics and security groups is tested in `test_mcp_server`.
   run or an error message can never set the signal. A follow-up should
   derive the signal from the tool's structured pod-status field instead
   of from text.
+- Selecting current findings fails closed on ambiguity: a specialist
+  whose records collide on a finding ID, or that has two different
+  records at one attempt, yields no finding at all, even if a later
+  attempt is clean. Phase 1 cannot produce this, because there is no
+  re-investigation loop. The Phase 2 retry loop must write each new
+  finding with a unique ID and an increased attempt number.
 - Only a crash loop produces a proposal. Other failure types (image pull
   errors, OOM kills) investigate but propose nothing.
 - Deployment name: the MCP adapter passes the pod name as the deployment

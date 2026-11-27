@@ -491,7 +491,7 @@
     "id": "s016",
     "category": "evidence_gate",
     "layer": "gate",
-    "description": "Two usable Kubernetes findings with the signal both support the proposal.",
+    "description": "A later attempt supersedes an earlier one: only the latest Kubernetes finding supports the proposal.",
     "invariants": [
       "G1",
       "G2"
@@ -510,7 +510,8 @@
             "tool": "get_pod_status",
             "observation": "CrashLoopBackOff"
           }
-        ]
+        ],
+        "attempt": 1
       },
       {
         "ref": "k2",
@@ -518,19 +519,19 @@
         "signals": [
           "crash_loop"
         ],
-        "summary": "Second pod is in CrashLoopBackOff",
+        "summary": "Pod is in CrashLoopBackOff",
         "evidence": [
           {
             "tool": "get_pod_status",
             "observation": "CrashLoopBackOff"
           }
-        ]
+        ],
+        "attempt": 2
       }
     ],
     "expect": {
       "proposal": "rollout_restart",
       "supporting": [
-        "k1",
         "k2"
       ]
     }
@@ -539,7 +540,7 @@
     "id": "s017",
     "category": "finding_integrity",
     "layer": "gate",
-    "description": "Only the usable Kubernetes finding supports the proposal when another one is partial.",
+    "description": "A later partial attempt supersedes an earlier usable finding, so the stale crash_loop cannot support a proposal.",
     "invariants": [
       "G2",
       "G15"
@@ -558,7 +559,8 @@
             "tool": "get_pod_status",
             "observation": "CrashLoopBackOff"
           }
-        ]
+        ],
+        "attempt": 1
       },
       {
         "ref": "k2",
@@ -573,14 +575,12 @@
             "observation": "CrashLoopBackOff"
           }
         ],
+        "attempt": 2,
         "status": "partial"
       }
     ],
     "expect": {
-      "proposal": "rollout_restart",
-      "supporting": [
-        "k1"
-      ]
+      "proposal": "none"
     }
   },
   {
@@ -1563,6 +1563,254 @@
       "supporting": [
         "k1"
       ]
+    }
+  },
+  {
+    "id": "s043",
+    "category": "finding_integrity",
+    "layer": "gate",
+    "description": "stale_attempt_no_proposal: attempt 1 has crash_loop but attempt 2 is healthy, so there is no proposal.",
+    "invariants": [
+      "G1",
+      "G2"
+    ],
+    "incident": {},
+    "findings": [
+      {
+        "ref": "k1",
+        "agent": "kubernetes",
+        "signals": [
+          "crash_loop"
+        ],
+        "summary": "Pod is in CrashLoopBackOff",
+        "evidence": [
+          {
+            "tool": "get_pod_status",
+            "observation": "CrashLoopBackOff"
+          }
+        ],
+        "attempt": 1
+      },
+      {
+        "ref": "k2",
+        "agent": "kubernetes",
+        "signals": [],
+        "summary": "Pod is Running",
+        "evidence": [
+          {
+            "tool": "get_pod_status",
+            "observation": "Running"
+          }
+        ],
+        "attempt": 2
+      }
+    ],
+    "expect": {
+      "proposal": "none"
+    }
+  },
+  {
+    "id": "s044",
+    "category": "finding_integrity",
+    "layer": "gate",
+    "description": "duplicate_identical_records_collapse: identical records collapse to one current finding and one supporting ID.",
+    "invariants": [
+      "G1",
+      "G2"
+    ],
+    "incident": {},
+    "findings": [
+      {
+        "ref": "k1",
+        "agent": "kubernetes",
+        "signals": [
+          "crash_loop"
+        ],
+        "summary": "Pod is in CrashLoopBackOff",
+        "evidence": [
+          {
+            "tool": "get_pod_status",
+            "observation": "CrashLoopBackOff"
+          }
+        ],
+        "attempt": 1,
+        "finding_id": "dup-k1",
+        "recorded_at": "2026-01-01T00:00:00+00:00"
+      },
+      {
+        "ref": "k2",
+        "agent": "kubernetes",
+        "signals": [
+          "crash_loop"
+        ],
+        "summary": "Pod is in CrashLoopBackOff",
+        "evidence": [
+          {
+            "tool": "get_pod_status",
+            "observation": "CrashLoopBackOff"
+          }
+        ],
+        "attempt": 1,
+        "finding_id": "dup-k1",
+        "recorded_at": "2026-01-01T00:00:00+00:00"
+      }
+    ],
+    "expect": {
+      "proposal": "rollout_restart",
+      "supporting": [
+        "k1"
+      ]
+    }
+  },
+  {
+    "id": "s045",
+    "category": "finding_integrity",
+    "layer": "gate",
+    "description": "ambiguous_finding_id_no_proposal: one ID on two different records, one carrying crash_loop, excludes the specialist.",
+    "invariants": [
+      "G1",
+      "G2"
+    ],
+    "incident": {},
+    "findings": [
+      {
+        "ref": "k1",
+        "agent": "kubernetes",
+        "signals": [
+          "crash_loop"
+        ],
+        "summary": "Pod is in CrashLoopBackOff",
+        "evidence": [
+          {
+            "tool": "get_pod_status",
+            "observation": "CrashLoopBackOff"
+          }
+        ],
+        "attempt": 1,
+        "finding_id": "amb-1"
+      },
+      {
+        "ref": "k2",
+        "agent": "kubernetes",
+        "signals": [],
+        "summary": "Pod is Running",
+        "evidence": [
+          {
+            "tool": "get_pod_status",
+            "observation": "Running"
+          }
+        ],
+        "attempt": 1,
+        "finding_id": "amb-1"
+      }
+    ],
+    "expect": {
+      "proposal": "none"
+    }
+  },
+  {
+    "id": "s046",
+    "category": "finding_integrity",
+    "layer": "gate",
+    "description": "same_attempt_conflicting_records_no_proposal: two distinct records at the same attempt, one carrying crash_loop, exclude the specialist.",
+    "invariants": [
+      "G1",
+      "G2"
+    ],
+    "incident": {},
+    "findings": [
+      {
+        "ref": "k1",
+        "agent": "kubernetes",
+        "signals": [
+          "crash_loop"
+        ],
+        "summary": "Pod is in CrashLoopBackOff",
+        "evidence": [
+          {
+            "tool": "get_pod_status",
+            "observation": "CrashLoopBackOff"
+          }
+        ],
+        "attempt": 1
+      },
+      {
+        "ref": "k2",
+        "agent": "kubernetes",
+        "signals": [],
+        "summary": "Pod is Running",
+        "evidence": [
+          {
+            "tool": "get_pod_status",
+            "observation": "Running"
+          }
+        ],
+        "attempt": 1
+      }
+    ],
+    "expect": {
+      "proposal": "none"
+    }
+  },
+  {
+    "id": "s047",
+    "category": "finding_integrity",
+    "layer": "gate",
+    "description": "ambiguity_is_not_salvaged: an ambiguous attempt 1 excludes the specialist even when a clean attempt 2 carries crash_loop.",
+    "invariants": [
+      "G1",
+      "G2"
+    ],
+    "incident": {},
+    "findings": [
+      {
+        "ref": "k1",
+        "agent": "kubernetes",
+        "signals": [
+          "crash_loop"
+        ],
+        "summary": "Pod is in CrashLoopBackOff",
+        "evidence": [
+          {
+            "tool": "get_pod_status",
+            "observation": "CrashLoopBackOff"
+          }
+        ],
+        "attempt": 1,
+        "finding_id": "amb-2"
+      },
+      {
+        "ref": "k2",
+        "agent": "kubernetes",
+        "signals": [],
+        "summary": "Pod is Running",
+        "evidence": [
+          {
+            "tool": "get_pod_status",
+            "observation": "Running"
+          }
+        ],
+        "attempt": 1,
+        "finding_id": "amb-2"
+      },
+      {
+        "ref": "k3",
+        "agent": "kubernetes",
+        "signals": [
+          "crash_loop"
+        ],
+        "summary": "Pod is in CrashLoopBackOff",
+        "evidence": [
+          {
+            "tool": "get_pod_status",
+            "observation": "CrashLoopBackOff"
+          }
+        ],
+        "attempt": 2
+      }
+    ],
+    "expect": {
+      "proposal": "none"
     }
   }
 ]

@@ -526,8 +526,8 @@ def test_validation_rejects_graph_only_invariants_and_bad_risk_levels():
 def test_expectation_mismatches_are_reported_in_words():
     bad = scenario(
         findings=[
-            {"ref": "k1", "agent": "kubernetes", "signals": ["crash_loop"]},
-            {"ref": "k2", "agent": "kubernetes", "signals": ["crash_loop"]},
+            {"ref": "k1", "agent": "kubernetes", "signals": ["crash_loop"], "attempt": 1},
+            {"ref": "k2", "agent": "kubernetes", "signals": ["crash_loop"], "attempt": 2},
         ],
         expect={
             "proposal": "rollout_restart",
@@ -539,7 +539,7 @@ def test_expectation_mismatches_are_reported_in_words():
     outcome = run_gate_scenario(bad)
     text = " | ".join(outcome.expectation_failures)
     assert outcome.status == "failed"
-    assert "expected supporting ['k1'], got ['k1', 'k2']" in text
+    assert "expected supporting ['k1'], got ['k2']" in text
     assert "expected risk 'low', got 'medium'" in text
     assert "expected correlations ['corroborates'], got []" in text
     assert "expected proposal 'none', got 'rollout_restart'" in " | ".join(

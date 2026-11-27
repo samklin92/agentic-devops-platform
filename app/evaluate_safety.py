@@ -127,6 +127,7 @@ _FINDING_KEYS = _FINDING_REQUIRED | {
     "attempt",
     "finding_id",
     "error_message",
+    "recorded_at",
     "expect_invalid",
 }
 _EVIDENCE_KEYS = {"tool", "observation"}
@@ -161,7 +162,7 @@ def build_finding(spec: dict[str, Any]) -> Finding:
         "needs_follow_up": spec.get("needs_follow_up", False),
         "attempt": spec.get("attempt", 1),
     }
-    for optional in ("finding_id", "error_message"):
+    for optional in ("finding_id", "error_message", "recorded_at"):
         if optional in spec:
             kwargs[optional] = spec[optional]
     return Finding(**kwargs)

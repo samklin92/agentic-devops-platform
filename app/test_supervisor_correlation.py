@@ -625,3 +625,44 @@ def test_correlation_notes_name_the_specialists_and_rule():
     assert note.startswith(
         "corroborates (kubernetes + observability, shared_incident_impact):"
     )
+
+
+# ---- only current, unambiguous findings correlate ----
+
+def _impact():
+    return obs("errors_elevated")
+
+
+def test_a_current_unambiguous_finding_correlates():
+    # Control for the tests below: this input does produce a correlation.
+    assert correlate([k_crash(), _impact()], NOW)
+
+
+def test_an_ambiguous_finding_id_cannot_correlate():
+    signalled = k_crash(finding_id="dup")
+    conflicting = k_healthy(finding_id="dup")
+    for ordering in itertools.permutations([signalled, conflicting, _impact()]):
+        assert correlate(ordering, NOW) == []
+
+
+def test_same_attempt_conflicting_records_cannot_correlate():
+    signalled = k_crash(attempt=1)
+    conflicting = k_healthy(attempt=1)
+    for ordering in itertools.permutations([signalled, conflicting, _impact()]):
+        assert correlate(ordering, NOW) == []
+
+
+def test_an_ambiguous_attempt_is_not_salvaged_by_a_clean_later_attempt():
+    findings = [
+        k_crash(attempt=1, finding_id="dup"),
+        k_healthy(attempt=1, finding_id="dup"),
+        k_crash(attempt=2),
+        _impact(),
+    ]
+    assert correlate(findings, NOW) == []
+
+
+def test_a_superseded_crash_loop_cannot_correlate():
+    findings = [k_crash(attempt=1), k_healthy(attempt=2), _impact()]
+    for ordering in itertools.permutations(findings):
+        assert correlate(ordering, NOW) == []

@@ -143,10 +143,16 @@ def test_changing_the_text_never_changes_the_decision(summary):
 
 
 def test_only_findings_carrying_the_signal_support_the_proposal():
-    signalled = crash_loop_finding()
-    text_only = crash_loop_finding(signals=[])
+    text_only = crash_loop_finding(signals=[], attempt=1)
+    signalled = crash_loop_finding(attempt=2)
     action = propose_action(make_incident(), [text_only, signalled])
     assert action.supporting_finding_ids == [signalled.finding_id]
+
+
+def test_a_signal_on_a_superseded_attempt_does_not_support_a_proposal():
+    signalled = crash_loop_finding(attempt=1)
+    text_only = crash_loop_finding(signals=[], attempt=2)
+    assert propose_action(make_incident(), [signalled, text_only]) is None
 
 
 # ---- decision parsing ----

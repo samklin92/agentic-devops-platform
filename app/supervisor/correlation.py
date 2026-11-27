@@ -34,6 +34,7 @@ from app.state.models import (
     ProposedAction,
     utc_now,
 )
+from app.supervisor.current_findings import current_findings
 from app.supervisor.observability import OBSERVABILITY_REQUIRED_CHECKS
 from app.supervisor.proposals import is_usable
 
@@ -53,34 +54,6 @@ CAVEATS = (R1_CAVEAT, R2_CAVEAT)
 _IMPACT_SIGNALS = ("errors_elevated", "latency_elevated")
 _LOAD_SIGNALS = ("latency_elevated", "cpu_saturated")
 _NAMESPACE = uuid.UUID("5d0a7f3e-6c1b-4f0e-9a52-0d6f1c2b9e11")
-
-
-def _current_findings(findings: Iterable[Finding]) -> dict[str, Finding]:
-    """The latest unambiguous finding per specialist.
-
-    Exact duplicates collapse to one. A finding ID that maps to two
-    different records is ambiguous, and that specialist is left out.
-    """
-    by_id: dict[str, list[Finding]] = {}
-    for finding in findings:
-        by_id.setdefault(finding.finding_id, []).append(finding)
-
-    ambiguous_agents: set[str] = set()
-    unique: list[Finding] = []
-    for group in by_id.values():
-        if all(item == group[0] for item in group):
-            unique.append(group[0])
-        else:
-            ambiguous_agents.update(item.agent_name for item in group)
-
-    latest: dict[str, Finding] = {}
-    ordered = sorted(
-        unique, key=lambda f: (f.attempt, f.recorded_at, f.finding_id)
-    )
-    for finding in ordered:
-        if finding.agent_name not in ambiguous_agents:
-            latest[finding.agent_name] = finding
-    return latest
 
 
 def _completed_without_failed_runs(finding: Finding) -> bool:
@@ -131,7 +104,7 @@ def correlate(
     with the same IDs, in any input order.
     """
     now = now or utc_now()
-    current = _current_findings(findings)
+    current = current_findings(findings)
     usable = {
         agent: finding
         for agent, finding in current.items()
