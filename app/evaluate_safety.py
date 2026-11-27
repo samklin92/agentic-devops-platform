@@ -9,7 +9,7 @@ the run.
 A passing run means the defined evaluation set passed. It is not proof of
 universal safety.
 
-Usage: python -m app.evaluate_safety [path-to-scenarios.json]
+Usage: python -m app.evaluate_safety [--mutations] [path-to-scenarios.json]
 
 Milestone S1 provides the scenario schema, the loader and validation, the
 builders that turn scenario specs into real model objects, and the
@@ -18,7 +18,8 @@ correlation engine on each scenario's findings and checks every gate
 invariant on every scenario. S3 adds the graph layer: it drives the real
 compiled graph with scripted specialists and a scripted human on a real
 SQLite checkpoint and checks the approval, execution, audit, failure and
-budget invariants. The mutation tests arrive in S4.
+budget invariants. S4 adds the mutation tests (app/safety_mutations.py): deliberate
+faults the evaluation must detect, run with --mutations.
 """
 
 import json
@@ -144,6 +145,14 @@ class ScenarioError(ValueError):
     """A scenario is malformed or internally inconsistent."""
 
 
+class ExpectedInvalidAccepted(ScenarioError):
+    """The model accepted a finding the scenario expected it to reject.
+
+    A normal run treats this as an authoring error. A mutation run treats
+    it as a detection, because it shows a model rule is no longer enforced.
+    """
+
+
 # --- builders: scenario specs into real model objects --------------------
 
 
@@ -151,7 +160,9 @@ def build_incident(spec: dict[str, Any] | None = None) -> IncidentContext:
     return IncidentContext(**{**DEFAULT_INCIDENT, **(spec or {})})
 
 
-def build_finding(spec: dict[str, Any]) -> Finding:
+def build_finding(
+    spec: dict[str, Any], factory: Callable[..., Finding] = Finding
+) -> Finding:
     """Build a Finding through the real model, so its validators apply."""
     evidence = [
         AgentEvidence(source_tool=item["tool"], observation=item["observation"])
@@ -170,7 +181,7 @@ def build_finding(spec: dict[str, Any]) -> Finding:
     for optional in ("finding_id", "error_message", "recorded_at"):
         if optional in spec:
             kwargs[optional] = spec[optional]
-    return Finding(**kwargs)
+    return factory(**kwargs)
 
 
 @dataclass
@@ -182,7 +193,9 @@ class BuiltFindings:
         return list(self.findings.values())
 
 
-def build_findings(scenario: dict[str, Any]) -> BuiltFindings:
+def build_findings(
+    scenario: dict[str, Any], factory: Callable[..., Finding] = Finding
+) -> BuiltFindings:
     """Build every finding of a scenario.
 
     A finding marked expect_invalid must be rejected by the model, and any
@@ -194,7 +207,7 @@ def build_findings(scenario: dict[str, Any]) -> BuiltFindings:
     for spec in scenario["findings"]:
         ref = spec["ref"]
         try:
-            finding = build_finding(spec)
+            finding = build_finding(spec, factory)
         except ValidationError as exc:
             if not spec.get("expect_invalid", False):
                 raise ScenarioError(
@@ -203,7 +216,7 @@ def build_findings(scenario: dict[str, Any]) -> BuiltFindings:
             rejected.append(ref)
             continue
         if spec.get("expect_invalid", False):
-            raise ScenarioError(
+            raise ExpectedInvalidAccepted(
                 f"Finding '{ref}' is marked expect_invalid but the model accepted it."
             )
         built[ref] = finding
@@ -731,6 +744,9 @@ class GateImplementation:
     propose: Callable[..., ProposedAction | None] = propose_action
     correlate: Callable[..., list[Correlation]] = correlate
     annotate: Callable[..., ProposedAction | None] = annotate_action
+    # How scenario findings are constructed. Scenario files are always
+    # validated with the real model, only a run can swap this.
+    finding_factory: Callable[..., Finding] = Finding
 
 
 @dataclass
@@ -975,7 +991,7 @@ def run_gate_scenario(
     """Run one gate scenario and check its expectation and every invariant."""
     impl = impl or GateImplementation()
     incident = build_incident(scenario["incident"])
-    built = build_findings(scenario)
+    built = build_findings(scenario, impl.finding_factory)
     findings = built.ordered()
     action = impl.propose(incident, findings)
     correlations = impl.correlate(findings, now=FIXED_NOW)
@@ -1538,14 +1554,33 @@ def evaluate(
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
+    with_mutations = "--mutations" in args
+    args = [arg for arg in args if arg != "--mutations"]
+    unknown = [arg for arg in args if arg.startswith("--")]
+    if unknown:
+        print(
+            f"Unknown option(s) {unknown}. Usage: python -m app.evaluate_safety "
+            "[--mutations] [path-to-scenarios.json]"
+        )
+        return 2
     path = Path(args[0]) if args else SCENARIO_PATH
     try:
         scenarios = load_scenarios(path)
     except (OSError, ValueError) as exc:
         print(f"Invalid safety scenario set: {exc}")
         return 1
-    report = evaluate(scenarios)
+    if with_mutations:
+        from app.safety_mutations import evaluate_with_mutations
+
+        report = evaluate_with_mutations(scenarios)
+    else:
+        report = evaluate(scenarios)
     print(format_report(report))
+    if with_mutations and report.mutations is None:
+        print(
+            "\nMutation tests were not run: the real implementation does not "
+            "pass the evaluation."
+        )
     return exit_code(report)
 
 
