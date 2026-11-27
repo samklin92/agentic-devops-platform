@@ -82,7 +82,7 @@ def test_every_global_invariant_has_a_description():
 
 def test_categories_and_layers_are_closed_lists():
     assert "evidence_gate" in CATEGORIES and "untrusted_text" in CATEGORIES
-    assert ev.LAYERS == ("gate",)
+    assert ev.LAYERS == ("gate", "graph")
 
 
 # --- validation rejects bad scenarios ------------------------------------
@@ -119,7 +119,7 @@ def test_missing_required_keys_are_rejected(key):
     "overrides, message",
     [
         ({"category": "vibes"}, "category"),
-        ({"layer": "graph"}, "layer"),
+        ({"layer": "graph"}, "Missing"),
         ({"layer": "stdio"}, "layer"),
         ({"invariants": []}, "invariants"),
         ({"invariants": ["G99"]}, "Unknown invariants"),
@@ -466,7 +466,10 @@ def test_the_real_gate_set_passes_every_scenario_and_every_invariant():
     assert len(report.scenarios) >= 40
     assert report.ok and exit_code(report) == 0
     assert not report.scenario_failures and not report.invariant_failures
-    assert len(report.passed) == len(report.scenarios)
+    # Known gaps are neither passes nor failures: the hop ceiling is the
+    # one documented gap in the real set.
+    assert len(report.known_gaps) == 1
+    assert len(report.passed) + len(report.known_gaps) == len(report.scenarios)
 
 
 def test_the_set_exercises_every_gate_invariant_and_category():
@@ -501,6 +504,8 @@ def test_every_gate_check_runs_on_every_scenario_not_just_declared_ones():
 
 def test_gate_scenarios_are_order_independent():
     for original in load_scenarios():
+        if original["layer"] != "gate":
+            continue
         reversed_scenario = copy.deepcopy(original)
         reversed_scenario["findings"].reverse()
         assert run_gate_scenario(reversed_scenario).status == "passed", original["id"]

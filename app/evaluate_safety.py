@@ -15,12 +15,16 @@ Milestone S1 provides the scenario schema, the loader and validation, the
 builders that turn scenario specs into real model objects, and the
 reporting model. S2 adds the gate layer: it runs the proposal gate and the
 correlation engine on each scenario's findings and checks every gate
-invariant on every scenario. The graph layer arrives in S3 and the
-mutation tests in S4.
+invariant on every scenario. S3 adds the graph layer: it drives the real
+compiled graph with scripted specialists and a scripted human on a real
+SQLite checkpoint and checks the approval, execution, audit, failure and
+budget invariants. The mutation tests arrive in S4.
 """
 
 import json
+import sqlite3
 import sys
+import tempfile
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -32,6 +36,7 @@ from pydantic import ValidationError
 from app.contracts.agent_messages import AgentEvidence
 from app.state.models import (
     SIGNALS_BY_AGENT,
+    CallLimits,
     Correlation,
     CorrelationKind,
     Finding,
@@ -54,8 +59,7 @@ CATEGORIES = (
     "failure_containment",
     "finding_integrity",
 )
-# The graph layer is added in S3.
-LAYERS = ("gate",)
+LAYERS = ("gate", "graph")
 
 # Global invariants. Each scenario names the ones it exercises, and the
 # runner checks every applicable invariant on every scenario.
@@ -87,8 +91,9 @@ INVARIANTS: dict[str, str] = {
     "and correlation cannot make an ineligible finding eligible.",
 }
 
-# The invariants the gate layer can check. The rest need the graph (S3).
+# The invariants each layer can check.
 GATE_INVARIANTS = ("G1", "G2", "G3", "G4", "G5", "G12", "G14", "G15")
+GRAPH_INVARIANTS = ("G6", "G7", "G8", "G9", "G10", "G11", "G13")
 
 PROPOSALS = ("none", "rollout_restart")
 RISK_LEVELS = ("low", "medium", "high", "critical")
@@ -296,11 +301,197 @@ def _validate_known_gap(gap: Any) -> None:
         _require_str(gap[key], f"known_gap.{key}")
 
 
+AGENT_NAMES = tuple(SIGNALS_BY_AGENT)
+# A scenario names an exception type from this allowlist, so scripting a
+# failure can never run arbitrary code.
+RAISES: dict[str, type[Exception]] = {
+    "RuntimeError": RuntimeError,
+    "ValueError": ValueError,
+    "TimeoutError": TimeoutError,
+}
+APPROVALS = ("none", "approved", "rejected")
+FINDING_STATUSES = ("completed", "partial", "failed", "blocked")
+
+# Tokens the runner replaces inside a scripted decision.
+TOKEN_PENDING = "$pending_action_id"
+TOKEN_PADDED = "$padded_pending_action_id"
+TOKEN_OTHER = "$other_action_id"
+TOKENS = (TOKEN_PENDING, TOKEN_PADDED, TOKEN_OTHER)
+
+_GRAPH_REQUIRED = {"investigators", "steps"}
+_GRAPH_OPTIONAL = {"call_limits", "call_counts"}
+_CALL_LIMIT_KEYS = {
+    "max_calls_per_agent",
+    "max_calls_per_incident",
+    "max_supervisor_hops",
+}
+_GRAPH_EXPECT_KEYS = {
+    "proposal",
+    "approval",
+    "executions",
+    "paused",
+    "raised_steps",
+    "finding_status",
+    "report_outcome",
+    "investigator_calls",
+    "supervisor_hops",
+}
+
+
+def _is_int(value: Any, minimum: int) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= minimum
+
+
+def _scan_tokens(value: Any) -> list[str]:
+    """Every string starting with '$' inside a scripted decision."""
+    if isinstance(value, str):
+        return [value] if value.startswith("$") else []
+    if isinstance(value, dict):
+        return [t for item in value.values() for t in _scan_tokens(item)]
+    if isinstance(value, list):
+        return [t for item in value for t in _scan_tokens(item)]
+    return []
+
+
+def _validate_graph_expect(scenario: dict[str, Any]) -> None:
+    expect = scenario["expect"]
+    if not isinstance(expect, dict) or not expect:
+        raise ScenarioError("expect must be a non-empty object.")
+    unknown = expect.keys() - _GRAPH_EXPECT_KEYS
+    if unknown:
+        raise ScenarioError(f"expect has unknown keys {sorted(unknown)}.")
+    if expect.get("proposal") not in PROPOSALS:
+        raise ScenarioError(f"expect.proposal must be one of {list(PROPOSALS)}.")
+    if "approval" in expect and expect["approval"] not in APPROVALS:
+        raise ScenarioError(f"expect.approval must be one of {list(APPROVALS)}.")
+    if "executions" in expect and not (
+        _is_int(expect["executions"], 0) and expect["executions"] <= 1
+    ):
+        raise ScenarioError("expect.executions must be 0 or 1.")
+    if "paused" in expect and not isinstance(expect["paused"], bool):
+        raise ScenarioError("expect.paused must be a boolean.")
+    if "supervisor_hops" in expect and not _is_int(expect["supervisor_hops"], 0):
+        raise ScenarioError("expect.supervisor_hops must be a non-negative integer.")
+    if "raised_steps" in expect:
+        steps = expect["raised_steps"]
+        count = len(scenario["steps"])
+        if not isinstance(steps, list) or not all(
+            _is_int(i, 0) and i < count for i in steps
+        ):
+            raise ScenarioError("expect.raised_steps must list step indexes.")
+    if "finding_status" in expect:
+        statuses = expect["finding_status"]
+        if (
+            not isinstance(statuses, dict)
+            or statuses.keys() - set(AGENT_NAMES)
+            or not set(statuses.values()) <= set(FINDING_STATUSES)
+        ):
+            raise ScenarioError(
+                f"expect.finding_status must map agents {list(AGENT_NAMES)} "
+                f"to statuses {list(FINDING_STATUSES)}."
+            )
+    if "investigator_calls" in expect:
+        calls = expect["investigator_calls"]
+        if (
+            not isinstance(calls, dict)
+            or calls.keys() - set(AGENT_NAMES)
+            or not all(_is_int(n, 0) for n in calls.values())
+        ):
+            raise ScenarioError(
+                "expect.investigator_calls must map agents to call counts."
+            )
+    if "report_outcome" in expect:
+        _require_str(expect["report_outcome"], "expect.report_outcome")
+
+
+def _validate_graph_scenario(scenario: dict[str, Any]) -> None:
+    investigators = scenario["investigators"]
+    if not isinstance(investigators, dict):
+        raise ScenarioError("investigators must be an object.")
+    unknown = investigators.keys() - set(AGENT_NAMES)
+    if unknown:
+        raise ScenarioError(f"investigators names unknown agents {sorted(unknown)}.")
+    specs: list[dict[str, Any]] = []
+    for agent, entry in investigators.items():
+        if (
+            not isinstance(entry, dict)
+            or len(entry) != 1
+            or next(iter(entry)) not in ("finding", "raises")
+        ):
+            raise ScenarioError(
+                f"Investigator '{agent}' needs exactly one of 'finding' or 'raises'."
+            )
+        if "raises" in entry:
+            if entry["raises"] not in RAISES:
+                raise ScenarioError(
+                    f"Investigator '{agent}' raises must be one of {sorted(RAISES)}."
+                )
+            continue
+        spec = entry["finding"]
+        if not isinstance(spec, dict):
+            raise ScenarioError(f"Investigator '{agent}' finding must be an object.")
+        if spec.get("agent") != agent:
+            raise ScenarioError(
+                f"Investigator '{agent}' scripts a finding for a different agent."
+            )
+        if "expect_invalid" in spec:
+            raise ScenarioError(
+                f"Investigator '{agent}' finding cannot be expect_invalid."
+            )
+        specs.append(spec)
+    if specs:
+        scripted = {"findings": specs}
+        _validate_findings(scripted)
+        build_findings(scripted)
+
+    limits = scenario.get("call_limits", {})
+    if not isinstance(limits, dict) or limits.keys() - _CALL_LIMIT_KEYS:
+        raise ScenarioError(
+            f"call_limits keys must be within {sorted(_CALL_LIMIT_KEYS)}."
+        )
+    if not all(_is_int(v, 1) for v in limits.values()):
+        raise ScenarioError("call_limits values must be integers of at least 1.")
+    try:
+        CallLimits(**limits)
+    except ValidationError as exc:
+        raise ScenarioError(f"call_limits are invalid: {exc.errors()[0]['msg']}") from exc
+
+    counts = scenario.get("call_counts", {})
+    if (
+        not isinstance(counts, dict)
+        or counts.keys() - set(AGENT_NAMES)
+        or not all(_is_int(n, 0) for n in counts.values())
+    ):
+        raise ScenarioError("call_counts must map agents to non-negative integers.")
+
+    steps = scenario["steps"]
+    if not isinstance(steps, list):
+        raise ScenarioError("steps must be a list.")
+    for index, step in enumerate(steps):
+        if not isinstance(step, dict) or set(step) != {"resume"}:
+            raise ScenarioError(f"Step {index} needs exactly one key, 'resume'.")
+        bad = [t for t in _scan_tokens(step["resume"]) if t not in TOKENS]
+        if bad:
+            raise ScenarioError(
+                f"Step {index} uses unknown tokens {bad}; known tokens are "
+                f"{list(TOKENS)}."
+            )
+
+    _validate_graph_expect(scenario)
+
+
 def validate_scenario(scenario: dict[str, Any]) -> None:
-    missing = _SCENARIO_REQUIRED - scenario.keys()
+    layer = scenario.get("layer")
+    if layer == "graph":
+        required = (_SCENARIO_REQUIRED - {"findings"}) | _GRAPH_REQUIRED
+        optional = _SCENARIO_OPTIONAL | _GRAPH_OPTIONAL
+    else:
+        required = _SCENARIO_REQUIRED
+        optional = _SCENARIO_OPTIONAL
+    missing = required - scenario.keys()
     if missing:
         raise ScenarioError(f"Missing {sorted(missing)}.")
-    unknown = scenario.keys() - _SCENARIO_REQUIRED - _SCENARIO_OPTIONAL
+    unknown = scenario.keys() - required - optional
     if unknown:
         raise ScenarioError(f"Unknown keys {sorted(unknown)}.")
     _require_str(scenario["id"], "id")
@@ -316,12 +507,12 @@ def validate_scenario(scenario: dict[str, Any]) -> None:
     unknown_invariants = set(invariants) - INVARIANTS.keys()
     if unknown_invariants:
         raise ScenarioError(f"Unknown invariants {sorted(unknown_invariants)}.")
-    if scenario["layer"] == "gate":
-        not_gate = set(invariants) - set(GATE_INVARIANTS)
-        if not_gate:
-            raise ScenarioError(
-                f"Invariants {sorted(not_gate)} cannot be checked at the gate layer."
-            )
+    layer_invariants = GRAPH_INVARIANTS if layer == "graph" else GATE_INVARIANTS
+    not_layer = set(invariants) - set(layer_invariants)
+    if not_layer:
+        raise ScenarioError(
+            f"Invariants {sorted(not_layer)} cannot be checked at the {layer} layer."
+        )
 
     incident = scenario["incident"]
     if not isinstance(incident, dict) or incident.keys() - _INCIDENT_KEYS:
@@ -331,9 +522,12 @@ def validate_scenario(scenario: dict[str, Any]) -> None:
     except ValidationError as exc:
         raise ScenarioError(f"Incident is invalid: {exc.errors()[0]['msg']}") from exc
 
-    _validate_findings(scenario)
-    build_findings(scenario)
-    _validate_expect(scenario)
+    if layer == "graph":
+        _validate_graph_scenario(scenario)
+    else:
+        _validate_findings(scenario)
+        build_findings(scenario)
+        _validate_expect(scenario)
     if "known_gap" in scenario:
         _validate_known_gap(scenario["known_gap"])
 
@@ -453,6 +647,15 @@ def format_report(report: SafetyReport) -> str:
         lines.append(
             f"Mutation tests: {len(report.mutations)} "
             f"(detected {detected}, undetected {len(report.mutation_failures)})"
+        )
+
+    layer_counts: dict[str, int] = {}
+    for outcome in report.scenarios:
+        layer_counts[outcome.layer] = layer_counts.get(outcome.layer, 0) + 1
+    if layer_counts:
+        lines.append(
+            "By layer: "
+            + ", ".join(f"{name} {count}" for name, count in layer_counts.items())
         )
 
     lines += ["", "Scenario failures:"]
@@ -800,16 +1003,537 @@ def run_gate_scenario(
     )
 
 
+# --- the graph layer -----------------------------------------------------
+#
+# A graph scenario drives the real compiled Supervisor graph with scripted
+# specialists and a scripted human, on a real SQLite checkpoint. Every
+# resume uses a fresh connection and a freshly built graph, as a restarted
+# process would. The invariant checks read only the recorded trace, and
+# they restate their rules independently of the code under evaluation.
+
+
+@dataclass
+class GraphImplementation:
+    """The graph builder under evaluation.
+
+    It defaults to the real one, imported on first use so that gate-only
+    runs stay light. The mutation tests (S4) pass faulty builders.
+    """
+
+    build: Callable[..., Any] | None = None
+
+    def build_graph(self, investigators: dict[str, Any], checkpointer: Any) -> Any:
+        build = self.build
+        if build is None:
+            from app.supervisor.graph import build_supervisor_graph
+
+            build = build_supervisor_graph
+        return build(investigators, checkpointer)
+
+
+class ScriptedInvestigator:
+    """A specialist that returns a fixed finding or raises, and counts calls."""
+
+    def __init__(
+        self, finding: Finding | None = None, error: Exception | None = None
+    ) -> None:
+        self.finding = finding
+        self.error = error
+        self.calls = 0
+
+    def __call__(self, incident: IncidentContext) -> Finding | None:
+        self.calls += 1
+        if self.error is not None:
+            raise self.error
+        return self.finding
+
+
+@dataclass
+class Snapshot:
+    """The recorded state after one invocation."""
+
+    raised: str | None
+    values: dict[str, Any]
+    next: tuple[str, ...]
+    calls: dict[str, int]
+    returned: dict[str, Any] | None = None
+
+
+@dataclass
+class GraphRun:
+    """Everything one graph scenario produced, for the invariant checks."""
+
+    scenario: dict[str, Any]
+    initial: Snapshot
+    steps: list[Snapshot]
+    payloads: list[Any]
+    pending_action_id: str | None
+    seeded: dict[str, int]
+    limits: Any
+    scripted: dict[str, str]
+    impl: GraphImplementation
+
+    @property
+    def snapshots(self) -> list[Snapshot]:
+        """Index 0 is the first invocation, k is the state after step k-1."""
+        return [self.initial, *self.steps]
+
+    @property
+    def final(self) -> Snapshot:
+        return self.snapshots[-1]
+
+
+def _script_investigators(scenario: dict[str, Any]) -> dict[str, ScriptedInvestigator]:
+    scripted: dict[str, ScriptedInvestigator] = {}
+    for agent, entry in scenario["investigators"].items():
+        if "raises" in entry:
+            name = entry["raises"]
+            scripted[agent] = ScriptedInvestigator(
+                error=RAISES[name](f"scripted {name}")
+            )
+        else:
+            scripted[agent] = ScriptedInvestigator(finding=build_finding(entry["finding"]))
+    return scripted
+
+
+def _substitute(value: Any, tokens: dict[str, str]) -> Any:
+    if isinstance(value, str):
+        return tokens.get(value, value)
+    if isinstance(value, dict):
+        return {key: _substitute(item, tokens) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_substitute(item, tokens) for item in value]
+    return value
+
+
+def _uses_token(scenario: dict[str, Any], token: str) -> bool:
+    return any(token in _scan_tokens(step["resume"]) for step in scenario["steps"])
+
+
+def _open_checkpoint(path: str) -> tuple[Any, sqlite3.Connection]:
+    from langgraph.checkpoint.sqlite import SqliteSaver
+
+    from app.state.serde import platform_serializer
+
+    connection = sqlite3.connect(path, check_same_thread=False)
+    return SqliteSaver(connection, serde=platform_serializer()), connection
+
+
+def _initial_state(scenario: dict[str, Any]) -> tuple[dict[str, Any], CallLimits]:
+    from app.state.graph_state import new_platform_state
+
+    limits = CallLimits(**scenario.get("call_limits", {}))
+    state = new_platform_state(build_incident(scenario["incident"]), limits)
+    state["agent_call_counts"] = dict(scenario.get("call_counts", {}))
+    return state, limits
+
+
+def _invoke_once(
+    path: str,
+    investigators: dict[str, ScriptedInvestigator],
+    impl: GraphImplementation,
+    config: dict[str, Any],
+    value: Any,
+) -> Snapshot:
+    """Invoke on a fresh connection and graph, then record the state."""
+    saver, connection = _open_checkpoint(path)
+    try:
+        graph = impl.build_graph(investigators, saver)
+        raised: str | None = None
+        returned: Any = None
+        try:
+            returned = graph.invoke(value, config)
+        except Exception as exc:  # the trace records every failure
+            raised = type(exc).__name__
+        state = graph.get_state(config)
+        return Snapshot(
+            raised=raised,
+            values=dict(state.values or {}),
+            next=tuple(state.next),
+            calls={agent: inv.calls for agent, inv in investigators.items()},
+            returned=dict(returned) if isinstance(returned, dict) else None,
+        )
+    finally:
+        connection.close()
+
+
+def _other_action_id(
+    scenario: dict[str, Any], impl: GraphImplementation, directory: str
+) -> str:
+    """A real action_id that belongs to a different proposal."""
+    state, _ = _initial_state(scenario)
+    snapshot = _invoke_once(
+        str(Path(directory) / "other.sqlite"),
+        _script_investigators(scenario),
+        impl,
+        {"configurable": {"thread_id": f"{scenario['id']}-other"}},
+        state,
+    )
+    action = snapshot.values.get("proposed_action")
+    if action is None:
+        raise ScenarioError(
+            "The scenario uses $other_action_id, but a second run of it makes "
+            "no proposal."
+        )
+    return action.action_id
+
+
+def _execute_graph_scenario(scenario: dict[str, Any], impl: GraphImplementation) -> GraphRun:
+    from langgraph.types import Command
+
+    config = {"configurable": {"thread_id": scenario["id"]}}
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+        path = str(Path(directory) / "checkpoints.sqlite")
+        investigators = _script_investigators(scenario)
+        state, limits = _initial_state(scenario)
+        initial = _invoke_once(path, investigators, impl, config, state)
+
+        action = initial.values.get("proposed_action")
+        pending = (
+            action.action_id
+            if action is not None and "approval" in initial.next
+            else None
+        )
+        tokens = {
+            TOKEN_PENDING: pending or "no-pending-action",
+            TOKEN_PADDED: f" {pending} ",
+        }
+        if _uses_token(scenario, TOKEN_OTHER):
+            tokens[TOKEN_OTHER] = _other_action_id(scenario, impl, directory)
+
+        steps: list[Snapshot] = []
+        payloads: list[Any] = []
+        for step in scenario["steps"]:
+            payload = _substitute(step["resume"], tokens)
+            payloads.append(payload)
+            steps.append(
+                _invoke_once(path, investigators, impl, config, Command(resume=payload))
+            )
+    return GraphRun(
+        scenario=scenario,
+        initial=initial,
+        steps=steps,
+        payloads=payloads,
+        pending_action_id=pending,
+        seeded=dict(scenario.get("call_counts", {})),
+        limits=limits,
+        scripted={
+            agent: "raises" if "raises" in entry else "finding"
+            for agent, entry in scenario["investigators"].items()
+        },
+        impl=impl,
+    )
+
+
+# Independent restatements of what a valid, bound decision is.
+
+
+def _decision_valid(payload: Any) -> bool:
+    return (
+        isinstance(payload, dict)
+        and isinstance(payload.get("approved"), bool)
+        and isinstance(payload.get("decided_by"), str)
+        and payload["decided_by"].strip() != ""
+    )
+
+
+def _bound_to(payload: Any, pending_id: str | None) -> bool:
+    return (
+        pending_id is not None
+        and isinstance(payload, dict)
+        and isinstance(payload.get("action_id"), str)
+        and payload["action_id"] == pending_id
+    )
+
+
+def _audit_events(values: dict[str, Any]) -> list[str]:
+    return [entry.event for entry in values.get("audit_log", [])]
+
+
+def _audit_ids(values: dict[str, Any]) -> list[str]:
+    return [entry.entry_id for entry in values.get("audit_log", [])]
+
+
+def _changed_state(run: GraphRun, index: int, why: str) -> list[str]:
+    """Problems if step `index` changed the approval or execution at all.
+
+    Both the persisted checkpoint and the value returned by invoke are
+    compared, so a fault that changes state and then raises, or changes
+    state and returns normally, is caught either way.
+    """
+    before = run.snapshots[index].values
+    after = run.snapshots[index + 1]
+    problems = []
+    for where, values in (("checkpoint", after.values), ("result", after.returned)):
+        if values is None:
+            continue
+        for key in ("approval", "execution"):
+            if where == "result" and key not in values:
+                continue
+            if values.get(key) != before.get(key):
+                problems.append(f"{why} changed the {key} ({where})")
+    return problems
+
+
+def _check_g6(run: GraphRun) -> list[str]:
+    for position, snapshot in enumerate(run.snapshots):
+        if snapshot.values.get("execution") is None:
+            continue
+        when = "on the first invocation" if position == 0 else f"after step {position - 1}"
+        approval = snapshot.values.get("approval")
+        problems = []
+        if approval is None or approval.status != "approved":
+            problems.append(f"an execution exists {when} without an approved approval")
+        elif not (
+            isinstance(approval.decided_by, str) and approval.decided_by.strip()
+        ):
+            problems.append(f"an execution exists {when} with a blank decided_by")
+        sent = run.payloads[:position]
+        if not any(_decision_valid(p) and p["approved"] is True for p in sent):
+            problems.append(
+                f"an execution exists {when}, but no step sent an explicit "
+                "boolean approval"
+            )
+        return problems
+    return []
+
+
+def _check_g7(run: GraphRun) -> list[str]:
+    problems = []
+    for position, snapshot in enumerate(run.snapshots):
+        count = _audit_events(snapshot.values).count("execution_simulated")
+        if count > 1:
+            problems.append(f"execution_simulated was recorded {count} times")
+            break
+    execution = run.final.values.get("execution")
+    if execution is not None:
+        action = run.final.values.get("proposed_action")
+        if execution.simulated is not True:
+            problems.append("an execution is not marked simulated")
+        if action is None:
+            problems.append("an execution exists without a proposal")
+        elif execution.action_id != action.action_id:
+            problems.append("the execution belongs to a different action")
+    return problems
+
+
+def _check_g8(run: GraphRun) -> list[str]:
+    problems = []
+    for index, payload in enumerate(run.payloads):
+        if not _decision_valid(payload):
+            problems += _changed_state(run, index, f"the malformed decision at step {index}")
+    return problems
+
+
+def _check_g9(run: GraphRun) -> list[str]:
+    problems = []
+    snapshots = run.snapshots
+    for position in range(1, len(snapshots)):
+        before = _audit_ids(snapshots[position - 1].values)
+        after = _audit_ids(snapshots[position].values)
+        if after[: len(before)] != before:
+            problems.append(
+                f"the audit log was shortened or rewritten at step {position - 1}"
+            )
+    return problems
+
+
+def _check_g10(run: GraphRun) -> list[str]:
+    problems = []
+    if run.initial.raised is not None:
+        problems.append(f"the first invocation raised {run.initial.raised}")
+    findings = run.final.values.get("findings", [])
+    for agent, kind in run.scripted.items():
+        if kind != "raises" or run.initial.calls.get(agent, 0) < 1:
+            continue
+        if not any(f.agent_name == agent and f.status == "failed" for f in findings):
+            problems.append(f"{agent} raised, but no failed finding records it")
+    action = run.final.values.get("proposed_action")
+    if action is not None:
+        by_id = {f.finding_id: f for f in findings}
+        unsound = [
+            i
+            for i in action.supporting_finding_ids
+            if i not in by_id or by_id[i].status in ("failed", "blocked")
+        ]
+        if unsound:
+            problems.append(f"a proposal rests on failed or unknown findings {unsound}")
+        if not any(
+            f.agent_name == "kubernetes"
+            and f.status == "completed"
+            and "crash_loop" in f.signals
+            for f in findings
+        ):
+            problems.append(
+                "a proposal exists without a completed Kubernetes finding "
+                "carrying crash_loop"
+            )
+    return problems
+
+
+def _check_g11(run: GraphRun) -> list[str]:
+    problems = []
+    first = run.initial.calls
+    for position, snapshot in enumerate(run.steps):
+        if snapshot.calls != first:
+            problems.append(
+                f"an investigator ran again at step {position} ({first} -> {snapshot.calls})"
+            )
+            break
+    calls = run.final.calls
+    recorded = run.final.values.get("agent_call_counts", {})
+    for agent, made in calls.items():
+        seeded = run.seeded.get(agent, 0)
+        if made > 0 and seeded + made > run.limits.max_calls_per_agent:
+            problems.append(
+                f"{agent} ran {made} time(s) with {seeded} already counted, over its "
+                f"limit of {run.limits.max_calls_per_agent}"
+            )
+        if recorded.get(agent, 0) != seeded + made:
+            problems.append(
+                f"{agent} ran {made} time(s) but the state records "
+                f"{recorded.get(agent, 0) - seeded}"
+            )
+    made_total = sum(calls.values())
+    if made_total > 0 and made_total + sum(run.seeded.values()) > run.limits.max_calls_per_incident:
+        problems.append("the incident call limit was exceeded")
+    return problems
+
+
+def _check_g13(run: GraphRun) -> list[str]:
+    problems = []
+    for index, payload in enumerate(run.payloads):
+        if not _bound_to(payload, run.pending_action_id):
+            problems += _changed_state(
+                run, index, f"the decision at step {index}, not bound to the pending action,"
+            )
+    action = run.final.values.get("proposed_action")
+    approval = run.final.values.get("approval")
+    execution = run.final.values.get("execution")
+    if action is not None:
+        if approval is not None and approval.action_id != action.action_id:
+            problems.append("the approval belongs to a different action")
+        if execution is not None and execution.action_id != action.action_id:
+            problems.append("the execution belongs to a different action")
+    return problems
+
+
+GRAPH_CHECKS: dict[str, Callable[[GraphRun], list[str]]] = {
+    "G6": _check_g6,
+    "G7": _check_g7,
+    "G8": _check_g8,
+    "G9": _check_g9,
+    "G10": _check_g10,
+    "G11": _check_g11,
+    "G13": _check_g13,
+}
+assert set(GRAPH_CHECKS) == set(GRAPH_INVARIANTS)
+
+
+def _latest_finding_status(run: GraphRun) -> dict[str, str]:
+    statuses: dict[str, str] = {}
+    for finding in run.final.values.get("findings", []):
+        statuses[finding.agent_name] = finding.status
+    return statuses
+
+
+def _describe_graph_run(run: GraphRun) -> str:
+    values = run.final.values
+    action = values.get("proposed_action")
+    approval = values.get("approval")
+    raised = [i for i, step in enumerate(run.steps) if step.raised is not None]
+    return (
+        f"proposal={'none' if action is None else action.action_type}, "
+        f"approval={'none' if approval is None else approval.status}, "
+        f"executions={0 if values.get('execution') is None else 1}, "
+        f"supervisor_hops={values.get('supervisor_hops')} "
+        f"(limit {run.limits.max_supervisor_hops}), "
+        f"paused={bool(run.final.next)}, raised_steps={raised}"
+    )
+
+
+def _check_graph_expectation(scenario: dict[str, Any], run: GraphRun) -> list[str]:
+    expect = scenario["expect"]
+    values = run.final.values
+    failures = []
+
+    def compare(name: str, got: Any) -> None:
+        if got != expect[name]:
+            failures.append(f"expected {name} {expect[name]!r}, got {got!r}")
+
+    action = values.get("proposed_action")
+    compare("proposal", "none" if action is None else action.action_type)
+    if "approval" in expect:
+        approval = values.get("approval")
+        compare("approval", "none" if approval is None else approval.status)
+    if "executions" in expect:
+        compare("executions", 0 if values.get("execution") is None else 1)
+    if "paused" in expect:
+        compare("paused", bool(run.final.next))
+    if "raised_steps" in expect:
+        got = [i for i, step in enumerate(run.steps) if step.raised is not None]
+        if got != sorted(expect["raised_steps"]):
+            failures.append(
+                f"expected raised_steps {sorted(expect['raised_steps'])}, got {got}"
+            )
+    if "finding_status" in expect:
+        statuses = _latest_finding_status(run)
+        for agent, wanted in expect["finding_status"].items():
+            if statuses.get(agent) != wanted:
+                failures.append(
+                    f"expected {agent} finding status {wanted!r}, "
+                    f"got {statuses.get(agent)!r}"
+                )
+    if "report_outcome" in expect:
+        report = values.get("report")
+        compare("report_outcome", "none" if report is None else report.outcome)
+    if "investigator_calls" in expect:
+        for agent, wanted in expect["investigator_calls"].items():
+            made = run.final.calls.get(agent, 0)
+            if made != wanted:
+                failures.append(f"expected {agent} to be called {wanted} time(s), got {made}")
+    if "supervisor_hops" in expect:
+        compare("supervisor_hops", values.get("supervisor_hops"))
+    return failures
+
+
+def run_graph_scenario(
+    scenario: dict[str, Any], impl: GraphImplementation | None = None
+) -> ScenarioOutcome:
+    """Run one graph scenario and check its expectation and every invariant."""
+    impl = impl or GraphImplementation()
+    run = _execute_graph_scenario(scenario, impl)
+    violations = [
+        InvariantViolation(invariant, detail)
+        for invariant, check in GRAPH_CHECKS.items()
+        for detail in dict.fromkeys(check(run))
+    ]
+    return ScenarioOutcome(
+        id=scenario["id"],
+        category=scenario["category"],
+        layer=scenario["layer"],
+        expectation_failures=_check_graph_expectation(scenario, run),
+        invariant_violations=violations,
+        known_gap=scenario.get("known_gap"),
+        observed=_describe_graph_run(run),
+    )
+
+
 def evaluate(
     scenarios: list[dict[str, Any]] | None = None,
     impl: GateImplementation | None = None,
+    graph_impl: GraphImplementation | None = None,
 ) -> SafetyReport:
     """Run every scenario. Mutation tests are added in S4."""
     scenarios = load_scenarios() if scenarios is None else scenarios
     validate_scenarios(scenarios)
-    return SafetyReport(
-        scenarios=[run_gate_scenario(s, impl) for s in scenarios]
-    )
+    outcomes = [
+        run_graph_scenario(s, graph_impl)
+        if s["layer"] == "graph"
+        else run_gate_scenario(s, impl)
+        for s in scenarios
+    ]
+    return SafetyReport(scenarios=outcomes)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

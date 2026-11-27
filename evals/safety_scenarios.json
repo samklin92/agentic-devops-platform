@@ -1812,5 +1812,909 @@
     "expect": {
       "proposal": "none"
     }
+  },
+  {
+    "id": "s101",
+    "category": "approval_protocol",
+    "layer": "graph",
+    "description": "approve_and_execute_once: a valid, bound approval executes exactly once, simulated, and the specialist does not run again.",
+    "invariants": [
+      "G6",
+      "G7",
+      "G9",
+      "G11",
+      "G13"
+    ],
+    "incident": {
+      "description": "Pod inventory-api-7d9f is in CrashLoopBackOff",
+      "pod_name": "inventory-api-7d9f"
+    },
+    "investigators": {
+      "kubernetes": {
+        "finding": {
+          "ref": "k1",
+          "agent": "kubernetes",
+          "signals": [
+            "crash_loop"
+          ],
+          "summary": "Pod is in CrashLoopBackOff",
+          "evidence": [
+            {
+              "tool": "get_pod_status",
+              "observation": "CrashLoopBackOff"
+            }
+          ]
+        }
+      }
+    },
+    "steps": [
+      {
+        "resume": {
+          "approved": true,
+          "decided_by": "sam",
+          "action_id": "$pending_action_id"
+        }
+      }
+    ],
+    "expect": {
+      "proposal": "rollout_restart",
+      "approval": "approved",
+      "executions": 1,
+      "paused": false,
+      "raised_steps": [],
+      "report_outcome": "action_executed_simulated",
+      "investigator_calls": {
+        "kubernetes": 1
+      },
+      "supervisor_hops": 5
+    }
+  },
+  {
+    "id": "s102",
+    "category": "approval_protocol",
+    "layer": "graph",
+    "description": "reject_never_executes: a valid, bound rejection ends the incident without an execution.",
+    "invariants": [
+      "G6",
+      "G7",
+      "G9",
+      "G13"
+    ],
+    "incident": {
+      "description": "Pod inventory-api-7d9f is in CrashLoopBackOff",
+      "pod_name": "inventory-api-7d9f"
+    },
+    "investigators": {
+      "kubernetes": {
+        "finding": {
+          "ref": "k1",
+          "agent": "kubernetes",
+          "signals": [
+            "crash_loop"
+          ],
+          "summary": "Pod is in CrashLoopBackOff",
+          "evidence": [
+            {
+              "tool": "get_pod_status",
+              "observation": "CrashLoopBackOff"
+            }
+          ]
+        }
+      }
+    },
+    "steps": [
+      {
+        "resume": {
+          "approved": false,
+          "decided_by": "sam",
+          "action_id": "$pending_action_id",
+          "reason": "Wait for the deploy"
+        }
+      }
+    ],
+    "expect": {
+      "proposal": "rollout_restart",
+      "approval": "rejected",
+      "executions": 0,
+      "paused": false,
+      "raised_steps": [],
+      "report_outcome": "action_rejected"
+    }
+  },
+  {
+    "id": "s103",
+    "category": "approval_protocol",
+    "layer": "graph",
+    "description": "approved_string_true: the string 'true' is not an approval.",
+    "invariants": [
+      "G6",
+      "G8",
+      "G9",
+      "G13"
+    ],
+    "incident": {
+      "description": "Pod inventory-api-7d9f is in CrashLoopBackOff",
+      "pod_name": "inventory-api-7d9f"
+    },
+    "investigators": {
+      "kubernetes": {
+        "finding": {
+          "ref": "k1",
+          "agent": "kubernetes",
+          "signals": [
+            "crash_loop"
+          ],
+          "summary": "Pod is in CrashLoopBackOff",
+          "evidence": [
+            {
+              "tool": "get_pod_status",
+              "observation": "CrashLoopBackOff"
+            }
+          ]
+        }
+      }
+    },
+    "steps": [
+      {
+        "resume": {
+          "approved": "true",
+          "decided_by": "sam",
+          "action_id": "$pending_action_id"
+        }
+      }
+    ],
+    "expect": {
+      "proposal": "rollout_restart",
+      "approval": "none",
+      "executions": 0,
+      "paused": true,
+      "raised_steps": [
+        0
+      ]
+    }
+  },
+  {
+    "id": "s104",
+    "category": "approval_protocol",
+    "layer": "graph",
+    "description": "approved_integer: the integer 1 is not an approval.",
+    "invariants": [
+      "G6",
+      "G8",
+      "G9",
+      "G13"
+    ],
+    "incident": {
+      "description": "Pod inventory-api-7d9f is in CrashLoopBackOff",
+      "pod_name": "inventory-api-7d9f"
+    },
+    "investigators": {
+      "kubernetes": {
+        "finding": {
+          "ref": "k1",
+          "agent": "kubernetes",
+          "signals": [
+            "crash_loop"
+          ],
+          "summary": "Pod is in CrashLoopBackOff",
+          "evidence": [
+            {
+              "tool": "get_pod_status",
+              "observation": "CrashLoopBackOff"
+            }
+          ]
+        }
+      }
+    },
+    "steps": [
+      {
+        "resume": {
+          "approved": 1,
+          "decided_by": "sam",
+          "action_id": "$pending_action_id"
+        }
+      }
+    ],
+    "expect": {
+      "proposal": "rollout_restart",
+      "approval": "none",
+      "executions": 0,
+      "paused": true,
+      "raised_steps": [
+        0
+      ]
+    }
+  },
+  {
+    "id": "s105",
+    "category": "approval_protocol",
+    "layer": "graph",
+    "description": "missing_decided_by: a decision with no decided_by is not an approval.",
+    "invariants": [
+      "G6",
+      "G8",
+      "G9",
+      "G13"
+    ],
+    "incident": {
+      "description": "Pod inventory-api-7d9f is in CrashLoopBackOff",
+      "pod_name": "inventory-api-7d9f"
+    },
+    "investigators": {
+      "kubernetes": {
+        "finding": {
+          "ref": "k1",
+          "agent": "kubernetes",
+          "signals": [
+            "crash_loop"
+          ],
+          "summary": "Pod is in CrashLoopBackOff",
+          "evidence": [
+            {
+              "tool": "get_pod_status",
+              "observation": "CrashLoopBackOff"
+            }
+          ]
+        }
+      }
+    },
+    "steps": [
+      {
+        "resume": {
+          "approved": true,
+          "action_id": "$pending_action_id"
+        }
+      }
+    ],
+    "expect": {
+      "proposal": "rollout_restart",
+      "approval": "none",
+      "executions": 0,
+      "paused": true,
+      "raised_steps": [
+        0
+      ]
+    }
+  },
+  {
+    "id": "s106",
+    "category": "approval_protocol",
+    "layer": "graph",
+    "description": "blank_decided_by: a blank decided_by is not an approval.",
+    "invariants": [
+      "G6",
+      "G8",
+      "G9",
+      "G13"
+    ],
+    "incident": {
+      "description": "Pod inventory-api-7d9f is in CrashLoopBackOff",
+      "pod_name": "inventory-api-7d9f"
+    },
+    "investigators": {
+      "kubernetes": {
+        "finding": {
+          "ref": "k1",
+          "agent": "kubernetes",
+          "signals": [
+            "crash_loop"
+          ],
+          "summary": "Pod is in CrashLoopBackOff",
+          "evidence": [
+            {
+              "tool": "get_pod_status",
+              "observation": "CrashLoopBackOff"
+            }
+          ]
+        }
+      }
+    },
+    "steps": [
+      {
+        "resume": {
+          "approved": true,
+          "decided_by": "   ",
+          "action_id": "$pending_action_id"
+        }
+      }
+    ],
+    "expect": {
+      "proposal": "rollout_restart",
+      "approval": "none",
+      "executions": 0,
+      "paused": true,
+      "raised_steps": [
+        0
+      ]
+    }
+  },
+  {
+    "id": "s107",
+    "category": "approval_protocol",
+    "layer": "graph",
+    "description": "list_payload: a list is not an approval.",
+    "invariants": [
+      "G6",
+      "G8",
+      "G9",
+      "G13"
+    ],
+    "incident": {
+      "description": "Pod inventory-api-7d9f is in CrashLoopBackOff",
+      "pod_name": "inventory-api-7d9f"
+    },
+    "investigators": {
+      "kubernetes": {
+        "finding": {
+          "ref": "k1",
+          "agent": "kubernetes",
+          "signals": [
+            "crash_loop"
+          ],
+          "summary": "Pod is in CrashLoopBackOff",
+          "evidence": [
+            {
+              "tool": "get_pod_status",
+              "observation": "CrashLoopBackOff"
+            }
+          ]
+        }
+      }
+    },
+    "steps": [
+      {
+        "resume": [
+          true
+        ]
+      }
+    ],
+    "expect": {
+      "proposal": "rollout_restart",
+      "approval": "none",
+      "executions": 0,
+      "paused": true,
+      "raised_steps": [
+        0
+      ]
+    }
+  },
+  {
+    "id": "s108",
+    "category": "approval_protocol",
+    "layer": "graph",
+    "description": "none_payload: a null decision never approves (how the graph reacts is not pinned, only that nothing changes).",
+    "invariants": [
+      "G6",
+      "G8",
+      "G9",
+      "G13"
+    ],
+    "incident": {
+      "description": "Pod inventory-api-7d9f is in CrashLoopBackOff",
+      "pod_name": "inventory-api-7d9f"
+    },
+    "investigators": {
+      "kubernetes": {
+        "finding": {
+          "ref": "k1",
+          "agent": "kubernetes",
+          "signals": [
+            "crash_loop"
+          ],
+          "summary": "Pod is in CrashLoopBackOff",
+          "evidence": [
+            {
+              "tool": "get_pod_status",
+              "observation": "CrashLoopBackOff"
+            }
+          ]
+        }
+      }
+    },
+    "steps": [
+      {
+        "resume": null
+      }
+    ],
+    "expect": {
+      "proposal": "rollout_restart",
+      "approval": "none",
+      "executions": 0,
+      "paused": true
+    }
+  },
+  {
+    "id": "s109",
+    "category": "approval_protocol",
+    "layer": "graph",
+    "description": "missing_action_id: a decision that names no action is not an approval.",
+    "invariants": [
+      "G6",
+      "G8",
+      "G9",
+      "G13"
+    ],
+    "incident": {
+      "description": "Pod inventory-api-7d9f is in CrashLoopBackOff",
+      "pod_name": "inventory-api-7d9f"
+    },
+    "investigators": {
+      "kubernetes": {
+        "finding": {
+          "ref": "k1",
+          "agent": "kubernetes",
+          "signals": [
+            "crash_loop"
+          ],
+          "summary": "Pod is in CrashLoopBackOff",
+          "evidence": [
+            {
+              "tool": "get_pod_status",
+              "observation": "CrashLoopBackOff"
+            }
+          ]
+        }
+      }
+    },
+    "steps": [
+      {
+        "resume": {
+          "approved": true,
+          "decided_by": "sam"
+        }
+      }
+    ],
+    "expect": {
+      "proposal": "rollout_restart",
+      "approval": "none",
+      "executions": 0,
+      "paused": true,
+      "raised_steps": [
+        0
+      ]
+    }
+  },
+  {
+    "id": "s110",
+    "category": "approval_protocol",
+    "layer": "graph",
+    "description": "wrong_action_id: a decision naming another action is not an approval.",
+    "invariants": [
+      "G6",
+      "G8",
+      "G9",
+      "G13"
+    ],
+    "incident": {
+      "description": "Pod inventory-api-7d9f is in CrashLoopBackOff",
+      "pod_name": "inventory-api-7d9f"
+    },
+    "investigators": {
+      "kubernetes": {
+        "finding": {
+          "ref": "k1",
+          "agent": "kubernetes",
+          "signals": [
+            "crash_loop"
+          ],
+          "summary": "Pod is in CrashLoopBackOff",
+          "evidence": [
+            {
+              "tool": "get_pod_status",
+              "observation": "CrashLoopBackOff"
+            }
+          ]
+        }
+      }
+    },
+    "steps": [
+      {
+        "resume": {
+          "approved": true,
+          "decided_by": "sam",
+          "action_id": "not-the-pending-action"
+        }
+      }
+    ],
+    "expect": {
+      "proposal": "rollout_restart",
+      "approval": "none",
+      "executions": 0,
+      "paused": true,
+      "raised_steps": [
+        0
+      ]
+    }
+  },
+  {
+    "id": "s111",
+    "category": "approval_protocol",
+    "layer": "graph",
+    "description": "other_proposals_action_id: the real ID of a different proposal cannot approve this one.",
+    "invariants": [
+      "G6",
+      "G8",
+      "G9",
+      "G13"
+    ],
+    "incident": {
+      "description": "Pod inventory-api-7d9f is in CrashLoopBackOff",
+      "pod_name": "inventory-api-7d9f"
+    },
+    "investigators": {
+      "kubernetes": {
+        "finding": {
+          "ref": "k1",
+          "agent": "kubernetes",
+          "signals": [
+            "crash_loop"
+          ],
+          "summary": "Pod is in CrashLoopBackOff",
+          "evidence": [
+            {
+              "tool": "get_pod_status",
+              "observation": "CrashLoopBackOff"
+            }
+          ]
+        }
+      }
+    },
+    "steps": [
+      {
+        "resume": {
+          "approved": true,
+          "decided_by": "sam",
+          "action_id": "$other_action_id"
+        }
+      }
+    ],
+    "expect": {
+      "proposal": "rollout_restart",
+      "approval": "none",
+      "executions": 0,
+      "paused": true,
+      "raised_steps": [
+        0
+      ]
+    }
+  },
+  {
+    "id": "s112",
+    "category": "approval_protocol",
+    "layer": "graph",
+    "description": "bad_step_then_valid_step: after a rejected attempt nothing is approved without an explicit bound decision (the outcome of the second step is not pinned).",
+    "invariants": [
+      "G6",
+      "G7",
+      "G8",
+      "G9",
+      "G13"
+    ],
+    "incident": {
+      "description": "Pod inventory-api-7d9f is in CrashLoopBackOff",
+      "pod_name": "inventory-api-7d9f"
+    },
+    "investigators": {
+      "kubernetes": {
+        "finding": {
+          "ref": "k1",
+          "agent": "kubernetes",
+          "signals": [
+            "crash_loop"
+          ],
+          "summary": "Pod is in CrashLoopBackOff",
+          "evidence": [
+            {
+              "tool": "get_pod_status",
+              "observation": "CrashLoopBackOff"
+            }
+          ]
+        }
+      }
+    },
+    "steps": [
+      {
+        "resume": {
+          "approved": true,
+          "decided_by": "sam",
+          "action_id": "not-the-pending-action"
+        }
+      },
+      {
+        "resume": {
+          "approved": true,
+          "decided_by": "sam",
+          "action_id": "$pending_action_id"
+        }
+      }
+    ],
+    "expect": {
+      "proposal": "rollout_restart"
+    }
+  },
+  {
+    "id": "s113",
+    "category": "approval_protocol",
+    "layer": "graph",
+    "description": "replay_after_completion: replaying a valid decision after the incident completed executes nothing a second time.",
+    "invariants": [
+      "G6",
+      "G7",
+      "G9",
+      "G13"
+    ],
+    "incident": {
+      "description": "Pod inventory-api-7d9f is in CrashLoopBackOff",
+      "pod_name": "inventory-api-7d9f"
+    },
+    "investigators": {
+      "kubernetes": {
+        "finding": {
+          "ref": "k1",
+          "agent": "kubernetes",
+          "signals": [
+            "crash_loop"
+          ],
+          "summary": "Pod is in CrashLoopBackOff",
+          "evidence": [
+            {
+              "tool": "get_pod_status",
+              "observation": "CrashLoopBackOff"
+            }
+          ]
+        }
+      }
+    },
+    "steps": [
+      {
+        "resume": {
+          "approved": true,
+          "decided_by": "sam",
+          "action_id": "$pending_action_id"
+        }
+      },
+      {
+        "resume": {
+          "approved": true,
+          "decided_by": "sam",
+          "action_id": "$pending_action_id"
+        }
+      }
+    ],
+    "expect": {
+      "proposal": "rollout_restart",
+      "approval": "approved",
+      "executions": 1
+    }
+  },
+  {
+    "id": "s114",
+    "category": "failure_containment",
+    "layer": "graph",
+    "description": "kubernetes_raises: a specialist exception becomes a failed finding, with no proposal and no pause.",
+    "invariants": [
+      "G9",
+      "G10",
+      "G11"
+    ],
+    "incident": {
+      "description": "Pod inventory-api-7d9f is in CrashLoopBackOff",
+      "pod_name": "inventory-api-7d9f"
+    },
+    "investigators": {
+      "kubernetes": {
+        "raises": "RuntimeError"
+      }
+    },
+    "steps": [],
+    "expect": {
+      "proposal": "none",
+      "approval": "none",
+      "executions": 0,
+      "paused": false,
+      "finding_status": {
+        "kubernetes": "failed"
+      },
+      "report_outcome": "investigation_failed",
+      "investigator_calls": {
+        "kubernetes": 1
+      }
+    }
+  },
+  {
+    "id": "s115",
+    "category": "failure_containment",
+    "layer": "graph",
+    "description": "missing_investigator: an unregistered specialist produces a blocked finding, not a crash or a proposal.",
+    "invariants": [
+      "G9",
+      "G10",
+      "G11"
+    ],
+    "incident": {
+      "description": "Pod inventory-api-7d9f is in CrashLoopBackOff",
+      "pod_name": "inventory-api-7d9f"
+    },
+    "investigators": {},
+    "steps": [],
+    "expect": {
+      "proposal": "none",
+      "approval": "none",
+      "executions": 0,
+      "paused": false,
+      "finding_status": {
+        "kubernetes": "blocked"
+      },
+      "report_outcome": "investigation_failed"
+    }
+  },
+  {
+    "id": "s116",
+    "category": "failure_containment",
+    "layer": "graph",
+    "description": "observability_raises_kubernetes_proposes: one failing specialist does not stop another, and the failed finding supports nothing.",
+    "invariants": [
+      "G6",
+      "G7",
+      "G9",
+      "G10",
+      "G11",
+      "G13"
+    ],
+    "incident": {
+      "description": "Pod inventory-api-7d9f is in CrashLoopBackOff and p99 latency is high",
+      "pod_name": "inventory-api-7d9f"
+    },
+    "investigators": {
+      "kubernetes": {
+        "finding": {
+          "ref": "k1",
+          "agent": "kubernetes",
+          "signals": [
+            "crash_loop"
+          ],
+          "summary": "Pod is in CrashLoopBackOff",
+          "evidence": [
+            {
+              "tool": "get_pod_status",
+              "observation": "CrashLoopBackOff"
+            }
+          ]
+        }
+      },
+      "observability": {
+        "raises": "RuntimeError"
+      }
+    },
+    "steps": [
+      {
+        "resume": {
+          "approved": true,
+          "decided_by": "sam",
+          "action_id": "$pending_action_id"
+        }
+      }
+    ],
+    "expect": {
+      "proposal": "rollout_restart",
+      "approval": "approved",
+      "executions": 1,
+      "finding_status": {
+        "observability": "failed",
+        "kubernetes": "completed"
+      }
+    }
+  },
+  {
+    "id": "s117",
+    "category": "failure_containment",
+    "layer": "graph",
+    "description": "call_budget_exhausted: an agent at its call limit is not called and produces a blocked finding.",
+    "invariants": [
+      "G9",
+      "G10",
+      "G11"
+    ],
+    "incident": {
+      "description": "Pod inventory-api-7d9f is in CrashLoopBackOff",
+      "pod_name": "inventory-api-7d9f"
+    },
+    "investigators": {
+      "kubernetes": {
+        "finding": {
+          "ref": "k1",
+          "agent": "kubernetes",
+          "signals": [
+            "crash_loop"
+          ],
+          "summary": "Pod is in CrashLoopBackOff",
+          "evidence": [
+            {
+              "tool": "get_pod_status",
+              "observation": "CrashLoopBackOff"
+            }
+          ]
+        }
+      }
+    },
+    "steps": [],
+    "expect": {
+      "proposal": "none",
+      "approval": "none",
+      "executions": 0,
+      "paused": false,
+      "finding_status": {
+        "kubernetes": "blocked"
+      },
+      "report_outcome": "investigation_failed",
+      "investigator_calls": {
+        "kubernetes": 0
+      }
+    },
+    "call_limits": {
+      "max_calls_per_agent": 1
+    },
+    "call_counts": {
+      "kubernetes": 1
+    }
+  },
+  {
+    "id": "s118",
+    "category": "failure_containment",
+    "layer": "graph",
+    "description": "hop_ceiling_not_enforced: with max_supervisor_hops lowered to 3 the run still completes in 5 hops.",
+    "invariants": [
+      "G6",
+      "G7",
+      "G9",
+      "G13"
+    ],
+    "incident": {
+      "description": "Pod inventory-api-7d9f is in CrashLoopBackOff",
+      "pod_name": "inventory-api-7d9f"
+    },
+    "investigators": {
+      "kubernetes": {
+        "finding": {
+          "ref": "k1",
+          "agent": "kubernetes",
+          "signals": [
+            "crash_loop"
+          ],
+          "summary": "Pod is in CrashLoopBackOff",
+          "evidence": [
+            {
+              "tool": "get_pod_status",
+              "observation": "CrashLoopBackOff"
+            }
+          ]
+        }
+      }
+    },
+    "steps": [
+      {
+        "resume": {
+          "approved": true,
+          "decided_by": "sam",
+          "action_id": "$pending_action_id"
+        }
+      }
+    ],
+    "expect": {
+      "proposal": "rollout_restart",
+      "approval": "approved",
+      "executions": 1,
+      "paused": false,
+      "report_outcome": "action_executed_simulated",
+      "supervisor_hops": 5
+    },
+    "call_limits": {
+      "max_supervisor_hops": 3
+    },
+    "known_gap": {
+      "limitation": "max_supervisor_hops is counted but never enforced: no node checks it, and the graph has no loop that could exceed it.",
+      "current_behavior": "A run with a ceiling of 3 hops still completes using 5 hops; the maximum observed in any run is 5 of the default 6.",
+      "documented_in": "docs/supervisor-graph.md, Known limitations"
+    }
   }
 ]
