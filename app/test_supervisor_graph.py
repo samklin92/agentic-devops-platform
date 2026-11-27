@@ -83,11 +83,16 @@ def run(db_path, investigators, state):
         connection.close()
 
 
-def resume(db_path, investigators, decision):
+def resume(db_path, investigators, decision, bind=True):
     """Resume on a new connection and graph object (simulated restart)."""
     saver, connection = open_saver(db_path)
     try:
         graph = build_supervisor_graph(investigators, saver)
+        # A real client echoes the action_id from the interrupt payload.
+        # Negative tests pass bind=False or an explicit action_id.
+        if bind and isinstance(decision, dict) and "action_id" not in decision:
+            pending = graph.get_state(CONFIG).values["proposed_action"]
+            decision = {**decision, "action_id": pending.action_id}
         return graph.invoke(Command(resume=decision), CONFIG)
     finally:
         connection.close()
@@ -535,3 +540,131 @@ def test_resume_from_a_checkpoint_written_before_correlations_existed(db_path):
     assert final["approval"].status == "approved"
     assert final["report"].outcome == "action_executed_simulated"
     assert "Evidence relationships" not in final["report"].summary
+
+
+# ---- approval is bound to the exact pending action ----
+
+BAD_ID_CASES = (
+    "missing",
+    "none",
+    "integer",
+    "blank",
+    "whitespace",
+    "wrong",
+    "padded",
+    "suffixed",
+    "other_proposal",
+)
+
+
+def bad_decisions(pending_id, other_id, approved):
+    base = {"approved": approved, "decided_by": "sam"}
+    return {
+        "missing": dict(base),
+        "none": {**base, "action_id": None},
+        "integer": {**base, "action_id": 123},
+        "blank": {**base, "action_id": ""},
+        "whitespace": {**base, "action_id": "   "},
+        "wrong": {**base, "action_id": "not-the-pending-action"},
+        "padded": {**base, "action_id": f" {pending_id} "},
+        "suffixed": {**base, "action_id": pending_id + "x"},
+        "other_proposal": {**base, "action_id": other_id},
+    }
+
+
+def pending_snapshot(db_path, investigators):
+    saver, connection = open_saver(db_path)
+    try:
+        graph = build_supervisor_graph(investigators, saver)
+        return graph.get_state(CONFIG)
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("approved", [True, False])
+@pytest.mark.parametrize("case", BAD_ID_CASES)
+def test_a_decision_not_bound_to_the_pending_action_fails_closed(
+    db_path, tmp_path, case, approved
+):
+    investigator = FakeInvestigator(crash_loop_finding())
+    investigators = {"kubernetes": investigator}
+    _, snapshot = run(db_path, investigators, new_platform_state(make_incident()))
+    pending_id = snapshot.values["proposed_action"].action_id
+    # A real action_id that belongs to a different proposal.
+    _, other = run(
+        tmp_path / "other.db",
+        {"kubernetes": FakeInvestigator(crash_loop_finding())},
+        new_platform_state(make_incident()),
+    )
+    other_id = other.values["proposed_action"].action_id
+    assert other_id != pending_id
+    audit_before = events(snapshot.values)
+
+    decision = bad_decisions(pending_id, other_id, approved)[case]
+    with pytest.raises(ValueError):
+        resume(db_path, investigators, decision, bind=False)
+
+    after = pending_snapshot(db_path, investigators)
+    assert after.next == ("approval",)
+    assert after.values.get("approval") is None
+    assert after.values.get("execution") is None
+    assert events(after.values) == audit_before
+    assert investigator.calls == 1
+
+
+def test_a_bad_resume_leaves_the_thread_replaying_it_and_nothing_runs(db_path):
+    """Known limitation, documented in docs/supervisor-graph.md.
+
+    LangGraph keeps the failed resume value against the pending interrupt,
+    so a later valid resume replays the bad one and raises again. Nothing
+    is approved or executed either way (fail closed), but the approval is
+    stuck. The Phase 2 API layer must therefore validate with
+    parse_decision before it resumes the graph. If the second resume ever
+    succeeds, LangGraph's behavior changed: that is not a safety
+    regression, so update the documentation and this test.
+    """
+    investigator = FakeInvestigator(crash_loop_finding())
+    investigators = {"kubernetes": investigator}
+    _, snapshot = run(db_path, investigators, new_platform_state(make_incident()))
+    audit_before = events(snapshot.values)
+
+    with pytest.raises(ValueError):
+        resume(
+            db_path,
+            investigators,
+            {"approved": True, "decided_by": "sam", "action_id": "wrong"},
+            bind=False,
+        )
+    with pytest.raises(ValueError):
+        resume(db_path, investigators, {"approved": True, "decided_by": "sam"})
+
+    after = pending_snapshot(db_path, investigators)
+    assert after.next == ("approval",)
+    assert after.values.get("approval") is None
+    assert after.values.get("execution") is None
+    assert events(after.values) == audit_before
+    assert investigator.calls == 1
+
+
+def test_validating_before_resuming_keeps_the_approval_available(db_path):
+    """The Phase 2 pattern: reject a bad decision before any resume."""
+    from app.supervisor.graph import parse_decision
+
+    investigator = FakeInvestigator(crash_loop_finding())
+    investigators = {"kubernetes": investigator}
+    _, snapshot = run(db_path, investigators, new_platform_state(make_incident()))
+    pending_id = snapshot.values["proposed_action"].action_id
+
+    bad = {"approved": True, "decided_by": "sam", "action_id": "wrong"}
+    with pytest.raises(ValueError):
+        parse_decision(bad, pending_id)  # the API layer stops here; no resume
+
+    final = resume(db_path, investigators, {"approved": True, "decided_by": "sam"})
+
+    assert final["approval"].status == "approved"
+    assert final["approval"].action_id == final["proposed_action"].action_id
+    assert final["execution"].simulated is True
+    assert final["execution"].action_id == final["proposed_action"].action_id
+    assert events(final).count("approval_granted") == 1
+    assert events(final).count("execution_simulated") == 1
+    assert investigator.calls == 1

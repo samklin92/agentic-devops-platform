@@ -160,11 +160,16 @@ report).
 
 ## Approval
 
-`approval` pauses the graph with a payload describing the action. The
-resume value must be a dict with a boolean `approved` and a non-empty
-`decided_by`; anything else raises an error, so a malformed payload can
-never count as approval (`parse_decision`). The payload also lists the
-action's correlations, so the approver sees how the evidence relates.
+`approval` pauses the graph with a payload describing the action,
+including its `action_id`. The resume value must be a dict with a
+boolean `approved`, a non-empty `decided_by` and an `action_id` that is
+exactly the pending action's ID (`parse_decision(raw,
+pending_action_id)`). A missing, blank, non-string or different
+`action_id` raises an error, as does anything else malformed, so a
+decision can never count as approval of an action it was not made for.
+Matching is exact: no trimming, case folding or type coercion, and the
+error messages echo neither ID. The payload also lists the action's
+correlations, so the approver sees how the evidence relates.
 
 ## Failure containment
 
@@ -322,6 +327,7 @@ metrics and security groups is tested in `test_mcp_server`.
 | No proposal without usable evidence | `proposals.py` | `test_supervisor_components`, `test_supervisor_graph`, `test_supervisor_stdio_integration` (healthy and unknown pod) |
 | No execution without approval | Graph edges: `execute` is reachable only through `approval` | `test_supervisor_graph` (rejected path) |
 | Malformed approval fails closed | `parse_decision` | `test_supervisor_components`, `test_supervisor_graph` |
+| A decision applies only to the exact pending action: a missing, blank, non-string or different `action_id` fails closed, with no approval record, no execution and an unchanged audit log | `parse_decision(raw, pending_action_id)`, called by the `approval` node | `test_supervisor_components`, `test_supervisor_graph` (every bad-ID case, approve and reject) |
 | Execution is simulated only | `ExecutionRecord.simulated` is `Literal[True]` | `test_state_models` |
 | Kubernetes agent gets only allowlisted read-only tools | `validate_tool_allowlist` | `test_supervisor_kubernetes_integration` |
 | A specialist failure does not crash the incident | `investigate` node | `test_supervisor_graph`, `test_supervisor_kubernetes_integration`, `test_supervisor_stdio_integration` |
@@ -405,6 +411,16 @@ metrics and security groups is tested in `test_mcp_server`.
   attempt is clean. Phase 1 cannot produce this, because there is no
   re-investigation loop. The Phase 2 retry loop must write each new
   finding with a unique ID and an increased attempt number.
+- A rejected approval decision (malformed, or bound to a different
+  action) raises out of `invoke` and writes no audit entry, because the
+  node fails before it returns any state. LangGraph also keeps the
+  failed resume value against the pending interrupt, so a later valid
+  resume replays the bad one and raises again: the approval is stuck,
+  but it fails closed and nothing is approved or executed
+  (`test_supervisor_graph` characterizes this). The Phase 2 API layer
+  must validate every decision with `parse_decision` before it resumes
+  the graph, and log rejected attempts itself. A bounded re-interrupt
+  loop that records each rejected attempt is an option to revisit then.
 - Only a crash loop produces a proposal. Other failure types (image pull
   errors, OOM kills) investigate but propose nothing.
 - Deployment name: the MCP adapter passes the pod name as the deployment

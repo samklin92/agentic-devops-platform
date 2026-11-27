@@ -90,10 +90,15 @@ def run(db_path, investigators, state):
         connection.close()
 
 
-def resume(db_path, investigators, decision):
+def resume(db_path, investigators, decision, bind=True):
     saver, connection = open_saver(db_path)
     try:
         graph = build_supervisor_graph(investigators, saver)
+        # A real client echoes the action_id from the interrupt payload.
+        # Negative tests pass bind=False or an explicit action_id.
+        if bind and isinstance(decision, dict) and "action_id" not in decision:
+            pending = graph.get_state(CONFIG).values["proposed_action"]
+            decision = {**decision, "action_id": pending.action_id}
         return graph.invoke(Command(resume=decision), CONFIG)
     finally:
         connection.close()

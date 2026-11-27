@@ -44,8 +44,17 @@ def audit(
     )
 
 
-def parse_decision(raw: Any) -> tuple[bool, str, str | None]:
-    """Validate a resume payload. Fails closed on anything malformed."""
+def parse_decision(
+    raw: Any, pending_action_id: str
+) -> tuple[bool, str, str | None]:
+    """Validate a resume payload against the pending action.
+
+    Fails closed on anything malformed. The decision must carry the exact
+    action_id of the pending proposal: a missing, blank, non-string or
+    different ID is rejected, so a decision can never be applied to an
+    action it was not made for. Error messages never echo the supplied
+    value.
+    """
     if not isinstance(raw, dict):
         raise ValueError("Approval decision must be a dict.")
     approved = raw.get("approved")
@@ -54,6 +63,13 @@ def parse_decision(raw: Any) -> tuple[bool, str, str | None]:
         raise ValueError("Approval decision needs a boolean 'approved'.")
     if not isinstance(decided_by, str) or not decided_by.strip():
         raise ValueError("Approval decision needs 'decided_by'.")
+    action_id = raw.get("action_id")
+    if not isinstance(action_id, str) or not action_id.strip():
+        raise ValueError("Approval decision needs 'action_id'.")
+    if action_id != pending_action_id:
+        raise ValueError(
+            "Approval decision action_id does not match the pending action."
+        )
     reason = raw.get("reason")
     return approved, decided_by.strip(), reason if isinstance(reason, str) else None
 
@@ -250,7 +266,9 @@ def build_supervisor_graph(
                 for c in current_correlations(state)
             ],
         })
-        approved, decided_by, reason = parse_decision(raw)
+        # The decision must name this exact action; anything else raises
+        # here, before any record or audit entry exists (fails closed).
+        approved, decided_by, reason = parse_decision(raw, action.action_id)
         record = ApprovalRecord(
             action_id=action.action_id,
             status="approved" if approved else "rejected",

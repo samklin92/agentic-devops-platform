@@ -157,15 +157,26 @@ def test_a_signal_on_a_superseded_attempt_does_not_support_a_proposal():
 
 # ---- decision parsing ----
 
+PENDING_ACTION_ID = "action-123"
+
+
+def decision_payload(**overrides):
+    data = {
+        "approved": True,
+        "decided_by": "sam",
+        "action_id": PENDING_ACTION_ID,
+    }
+    data.update(overrides)
+    return data
+
+
 def test_parse_decision_accepts_a_valid_payload():
     assert parse_decision(
-        {"approved": True, "decided_by": " sam ", "reason": "ok"}
+        decision_payload(decided_by=" sam ", reason="ok"), PENDING_ACTION_ID
     ) == (True, "sam", "ok")
-    assert parse_decision({"approved": False, "decided_by": "sam"}) == (
-        False,
-        "sam",
-        None,
-    )
+    assert parse_decision(
+        decision_payload(approved=False), PENDING_ACTION_ID
+    ) == (False, "sam", None)
 
 
 @pytest.mark.parametrize(
@@ -173,14 +184,63 @@ def test_parse_decision_accepts_a_valid_payload():
     [
         True,
         None,
-        {"approved": True},
-        {"approved": "yes", "decided_by": "sam"},
-        {"approved": True, "decided_by": "  "},
+        [],
+        "approved",
+        {},
+        {"approved": True, "decided_by": "sam"},
+        decision_payload(approved="yes"),
+        decision_payload(approved=1),
+        decision_payload(approved=None),
+        decision_payload(decided_by="  "),
+        decision_payload(decided_by=None),
     ],
 )
 def test_parse_decision_fails_closed(payload):
     with pytest.raises(ValueError):
-        parse_decision(payload)
+        parse_decision(payload, PENDING_ACTION_ID)
+
+
+@pytest.mark.parametrize(
+    "action_id",
+    [
+        None,
+        123,
+        0,
+        True,
+        ["action-123"],
+        "",
+        "   ",
+        "action-124",
+        "ACTION-123",
+        " action-123 ",
+        "action-123 ",
+        "action-12",
+        "action-1234",
+    ],
+)
+def test_parse_decision_requires_the_exact_pending_action_id(action_id):
+    with pytest.raises(ValueError):
+        parse_decision(decision_payload(action_id=action_id), PENDING_ACTION_ID)
+
+
+def test_parse_decision_without_an_action_id_fails_closed():
+    payload = decision_payload()
+    del payload["action_id"]
+    with pytest.raises(ValueError, match="action_id"):
+        parse_decision(payload, PENDING_ACTION_ID)
+
+
+def test_a_blank_pending_id_can_never_be_matched():
+    with pytest.raises(ValueError):
+        parse_decision(decision_payload(action_id=""), "")
+
+
+def test_parse_decision_errors_do_not_echo_either_id():
+    supplied = "supplied-id-must-not-leak"
+    with pytest.raises(ValueError) as error:
+        parse_decision(decision_payload(action_id=supplied), PENDING_ACTION_ID)
+    assert supplied not in str(error.value)
+    assert PENDING_ACTION_ID not in str(error.value)
 
 
 # ---- investigators ----
