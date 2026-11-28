@@ -47,6 +47,8 @@ from app.supervisor.proposals import is_usable
 # Captured before any mutation runs, so faulty wrappers never call a patched
 # name and the tests can prove nothing leaked.
 REAL_PARSE_DECISION = graph_module.parse_decision
+REAL_TRACK_USAGE = graph_module.track_usage
+REAL_PROPOSE_ACTION = graph_module.propose_action
 
 _PRODUCTION = ("production", "prod")
 
@@ -264,6 +266,35 @@ def _parse_without_binding(raw: Any, pending_action_id: str):
     return REAL_PARSE_DECISION(raw, pending_action_id)
 
 
+@contextmanager
+def _track_usage_dropping_records(
+    incident_id: str, agent_name: str, prices: Any = None
+) -> Iterator[Any]:
+    """Fault 13: what a specialist spent is silently discarded."""
+    with REAL_TRACK_USAGE(incident_id, agent_name, prices) as collector:
+        yield collector
+    collector.records.clear()
+    collector.dropped = 0
+
+
+def _spend_blocking_patches() -> dict[str, Any]:
+    """Fault 14: a large spend makes the gate refuse to propose."""
+    spent = {"tokens": 0}
+
+    @contextmanager
+    def tracking(incident_id: str, agent_name: str, prices: Any = None) -> Iterator[Any]:
+        with REAL_TRACK_USAGE(incident_id, agent_name, prices) as collector:
+            yield collector
+        spent["tokens"] += sum(r.total_tokens for r in collector.records)
+
+    def propose(incident: Any, findings: list[Finding]):
+        if spent["tokens"] > 10**9:
+            return None
+        return REAL_PROPOSE_ACTION(incident, findings)
+
+    return {"track_usage": tracking, "propose_action": propose}
+
+
 @dataclass(frozen=True)
 class Mutation:
     """One injected fault, for the gate layer or the graph layer."""
@@ -360,6 +391,18 @@ MUTATIONS: tuple[Mutation, ...] = (
         "ambiguous finding can support a proposal.",
         "gate",
         gate=lambda: GateImplementation(propose=_propose_from_raw_findings),
+    ),
+    Mutation(
+        "usage_silently_dropped",
+        "What a specialist spent is discarded before it reaches the state.",
+        "graph",
+        graph=lambda: {"track_usage": _track_usage_dropping_records},
+    ),
+    Mutation(
+        "usage_influences_the_proposal",
+        "A large recorded spend makes the gate refuse to propose a restart.",
+        "graph",
+        graph=_spend_blocking_patches,
     ),
 )
 

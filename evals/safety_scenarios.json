@@ -2716,5 +2716,178 @@
       "current_behavior": "A run with a ceiling of 3 hops still completes using 5 hops; the maximum observed in any run is 5 of the default 6.",
       "documented_in": "docs/supervisor-graph.md, Known limitations"
     }
+  },
+  {
+    "id": "s119",
+    "category": "failure_containment",
+    "layer": "graph",
+    "description": "usage_recorded_per_agent: each specialist's model calls are recorded against it, and the run decides exactly as it does without them.",
+    "invariants": [
+      "G9",
+      "G16"
+    ],
+    "incident": {
+      "description": "Pod inventory-api-7d9f is in CrashLoopBackOff and p99 latency is high",
+      "pod_name": "inventory-api-7d9f"
+    },
+    "investigators": {
+      "kubernetes": {
+        "finding": {
+          "ref": "k1",
+          "agent": "kubernetes",
+          "signals": [
+            "crash_loop"
+          ],
+          "summary": "Pod is in CrashLoopBackOff",
+          "evidence": [
+            {
+              "tool": "get_pod_status",
+              "observation": "CrashLoopBackOff"
+            }
+          ]
+        },
+        "llm_usage": [
+          {
+            "input_tokens": 100,
+            "output_tokens": 40
+          },
+          {
+            "input_tokens": 5,
+            "output_tokens": 5
+          }
+        ]
+      },
+      "observability": {
+        "finding": {
+          "ref": "o1",
+          "agent": "observability",
+          "summary": "Latency is elevated",
+          "evidence": [
+            {
+              "tool": "get_error_rate",
+              "observation": "error_rate=1%"
+            }
+          ]
+        },
+        "llm_usage": [
+          {
+            "input_tokens": 2,
+            "output_tokens": 3
+          }
+        ]
+      }
+    },
+    "steps": [
+      {
+        "resume": {
+          "approved": true,
+          "decided_by": "sam",
+          "action_id": "$pending_action_id"
+        }
+      }
+    ],
+    "expect": {
+      "proposal": "rollout_restart",
+      "approval": "approved",
+      "executions": 1,
+      "paused": false,
+      "report_outcome": "action_executed_simulated"
+    }
+  },
+  {
+    "id": "s120",
+    "category": "failure_containment",
+    "layer": "graph",
+    "description": "failed_specialist_spend_is_kept: a specialist that makes model calls and then raises still has its spend recorded.",
+    "invariants": [
+      "G10",
+      "G16"
+    ],
+    "incident": {
+      "description": "Pod inventory-api-7d9f is in CrashLoopBackOff",
+      "pod_name": "inventory-api-7d9f"
+    },
+    "investigators": {
+      "kubernetes": {
+        "raises": "RuntimeError",
+        "llm_usage": [
+          {
+            "input_tokens": 50,
+            "output_tokens": 20
+          }
+        ]
+      }
+    },
+    "steps": [],
+    "expect": {
+      "proposal": "none",
+      "approval": "none",
+      "executions": 0,
+      "paused": false,
+      "finding_status": {
+        "kubernetes": "failed"
+      },
+      "report_outcome": "investigation_failed"
+    }
+  },
+  {
+    "id": "s121",
+    "category": "failure_containment",
+    "layer": "graph",
+    "description": "huge_and_unreadable_usage_changes_nothing: an enormous spend and an unreadable response change no decision, and the unreadable call is audited, not hidden.",
+    "invariants": [
+      "G6",
+      "G7",
+      "G9",
+      "G13",
+      "G16"
+    ],
+    "incident": {
+      "description": "Pod inventory-api-7d9f is in CrashLoopBackOff",
+      "pod_name": "inventory-api-7d9f"
+    },
+    "investigators": {
+      "kubernetes": {
+        "finding": {
+          "ref": "k1",
+          "agent": "kubernetes",
+          "signals": [
+            "crash_loop"
+          ],
+          "summary": "Pod is in CrashLoopBackOff",
+          "evidence": [
+            {
+              "tool": "get_pod_status",
+              "observation": "CrashLoopBackOff"
+            }
+          ]
+        },
+        "llm_usage": [
+          {
+            "input_tokens": 1000000000000,
+            "output_tokens": 1000000000000
+          },
+          {
+            "unreadable": true
+          }
+        ]
+      }
+    },
+    "steps": [
+      {
+        "resume": {
+          "approved": true,
+          "decided_by": "sam",
+          "action_id": "$pending_action_id"
+        }
+      }
+    ],
+    "expect": {
+      "proposal": "rollout_restart",
+      "approval": "approved",
+      "executions": 1,
+      "paused": false,
+      "report_outcome": "action_executed_simulated"
+    }
   }
 ]

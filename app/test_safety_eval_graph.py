@@ -40,12 +40,12 @@ def graph_report():
 def test_the_real_graph_scenarios_pass_and_the_hop_ceiling_is_the_only_gap(
     graph_report,
 ):
-    assert len(graph_report.scenarios) == 18
+    assert len(graph_report.scenarios) == 21
     assert graph_report.ok
     assert not graph_report.scenario_failures
     assert not graph_report.invariant_failures
     assert [s.id for s in graph_report.known_gaps] == ["s118"]
-    assert len(graph_report.passed) == 17
+    assert len(graph_report.passed) == 20
 
 
 def test_every_graph_invariant_is_exercised_by_some_scenario():
@@ -369,3 +369,106 @@ def test_g11_catches_a_specialist_that_runs_again_or_exceeds_its_budget():
 
     within = violations(make_run(over, [], [], seeded={"kubernetes": 1}))
     assert within == {}
+
+
+# ---- G16: usage is observation only ----
+
+def usage_record(agent="kubernetes", input_tokens=1, output_tokens=2, incident="inc"):
+    return NS(
+        agent_name=agent,
+        incident_id=incident,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+    )
+
+
+RICH_ACTION = NS(
+    action_id="A1",
+    action_type="rollout_restart",
+    namespace="production",
+    target="deployment/inventory-api",
+    risk_level="medium",
+    supporting_finding_ids=["f1"],
+)
+
+
+def usage_run(records, scripted, events=(), twin=None, calls=None, incident_id="inc"):
+    final = snapshot(
+        action=RICH_ACTION,
+        findings=[KUBERNETES],
+        audit=[entry(1)] + [entry(10 + i, e) for i, e in enumerate(events)],
+        next_nodes=("approval",),
+        calls=calls,
+    )
+    final.values["usage"] = list(records)
+    run = make_run(final, [], [])
+    run.scripted_usage = scripted
+    run.incident_id = incident_id
+    run.twin = twin
+    return run
+
+
+SPENT = {"kubernetes": [{"input_tokens": 1, "output_tokens": 2}]}
+
+
+def test_g16_accepts_usage_that_matches_what_was_spent():
+    assert violations(usage_run([usage_record()], SPENT)) == {}
+
+
+def test_g16_catches_lost_extra_and_wrong_counts():
+    assert "G16" in violations(usage_run([], SPENT))
+    assert "G16" in violations(usage_run([usage_record(), usage_record()], SPENT))
+    assert "G16" in violations(usage_run([usage_record(output_tokens=9)], SPENT))
+    assert "G16" in violations(usage_run([usage_record(agent="security")], SPENT))
+
+
+def test_g16_catches_usage_for_another_incident():
+    assert "G16" in violations(usage_run([usage_record(incident="other")], SPENT))
+
+
+def test_g16_ignores_scripted_usage_of_a_specialist_that_never_ran():
+    found = violations(usage_run([], SPENT, calls={"kubernetes": 0}))
+    assert "G16" not in found
+
+
+def test_g16_requires_unreadable_calls_to_be_audited_and_only_those():
+    scripted = {"kubernetes": [{"input_tokens": 1, "output_tokens": 2}, {"unreadable": True}]}
+    assert violations(usage_run([usage_record()], scripted, events=["usage_not_recorded"])) == {}
+    assert "G16" in violations(usage_run([usage_record()], scripted))
+    assert "G16" in violations(usage_run([usage_record()], SPENT, events=["usage_not_recorded"]))
+
+
+def test_g16_catches_usage_that_changed_the_outcome():
+    plain = usage_run([], {})
+    changed = usage_run([usage_record()], SPENT, twin=plain)
+    changed.final.values["proposed_action"] = None
+    assert "G16" in violations(changed)
+    same = usage_run([usage_record()], SPENT, twin=usage_run([], {}))
+    assert violations(same) == {}
+
+
+@pytest.mark.parametrize(
+    "items",
+    [
+        "x",
+        [1],
+        [{"input_tokens": 1}],
+        [{"input_tokens": -1, "output_tokens": 1}],
+        [{"input_tokens": True, "output_tokens": 1}],
+        [{"input_tokens": 1.5, "output_tokens": 1}],
+        [{"unreadable": False}],
+        [{"unreadable": True, "input_tokens": 1}],
+    ],
+)
+def test_a_malformed_llm_usage_script_is_rejected(items):
+    scenario = real("s120")
+    scenario["investigators"]["kubernetes"]["llm_usage"] = items
+    with pytest.raises(ScenarioError, match="llm_usage"):
+        validate_scenario(scenario)
+
+
+def test_an_investigator_still_needs_exactly_one_of_finding_or_raises():
+    scenario = real("s120")
+    scenario["investigators"]["kubernetes"] = {"llm_usage": []}
+    with pytest.raises(ScenarioError, match="exactly one of"):
+        validate_scenario(scenario)

@@ -171,6 +171,33 @@ Matching is exact: no trimming, case folding or type coercion, and the
 error messages echo neither ID. The payload also lists the action's
 correlations, so the approver sees how the evidence relates.
 
+## LLM usage (`app/usage.py`)
+
+Model calls report their token counts so consumption and cost can be
+attributed to an incident and an agent. This is observation only: usage
+is recorded and never read by the proposal gate, the approval or the
+execution.
+
+- `track_usage(incident_id, agent_name)` opens a collector (a context
+  variable). `record_llm_usage(response, model=...)` reports one response
+  and is a no-op outside a collector, so the RAG code behaves as before.
+  It is called after the model call in `generate_answer` and
+  `evaluate_answer_grounding`.
+- The `investigate` node runs every specialist inside a collector and
+  returns the records through the `usage` reducer, including the spend of
+  a specialist that then fails. The node does not run again on resume, so
+  nothing is counted twice.
+- A record holds counts, the model, the agent and an estimated cost, never
+  prompt or response text.
+- Recording never raises into the caller. A response that cannot be read
+  is counted, and the node adds one `usage_not_recorded` audit entry
+  (counts only).
+- A cost is estimated only for a model in `app/llm_prices.json`, a table
+  maintained by hand that is empty by default. Any other model has an
+  unknown cost (`None`), never zero. `summarize_usage` reports
+  `unpriced_calls` per agent, and its `estimated_cost_usd` is a lower
+  bound while that count is above zero.
+
 ## Failure containment
 
 The `investigate` node turns each of these into a finding and an audit
@@ -350,7 +377,8 @@ metrics and security groups is tested in `test_mcp_server`.
 | One definition of the `crash_loop` signal name and its detection | `app/state/signals.py` | `test_state_signals`, `test_platform_state` |
 | The gate and correlation use the same current findings: latest attempt per specialist, duplicates collapsed, ambiguous specialists excluded | `current_findings` in `app/supervisor/current_findings.py` | `test_supervisor_current_findings`, `test_supervisor_correlation`, safety eval s016, s017, s043 to s047 |
 | A superseded or ambiguous finding never supports a proposal or a correlation | `propose_action` and `correlate` both read only `current_findings` | `test_supervisor_current_findings`, `test_supervisor_components`, `test_supervisor_correlation`, safety eval s043 to s047 |
-| The safety evaluation can fail: each of twelve injected faults is detected | `app/safety_mutations.py` | `test_safety_mutations`, `python -m app.evaluate_safety --mutations` |
+| Recorded LLM usage never changes a decision and is not lost when a specialist fails | `app/usage.py`, the `investigate` node | `test_usage`, `test_usage_wiring`, safety eval G16 (`s119` to `s121`) and its two mutations |
+| The safety evaluation can fail: each of fourteen injected faults is detected | `app/safety_mutations.py` | `test_safety_mutations`, `python -m app.evaluate_safety --mutations` |
 | An incomplete metrics picture is not usable evidence | `is_usable` requires `completed` | `test_supervisor_observability`, `test_supervisor_stdio_integration` (unknown service) |
 | A specialist does not run again on resume | Checkpoint written after the `investigate` node | `test_supervisor_graph`, `test_supervisor_stdio_integration` |
 
@@ -362,12 +390,13 @@ metrics and security groups is tested in `test_mcp_server`.
 `test_state_signals`,
 `test_supervisor_kubernetes_integration`, `test_supervisor_mcp_tools`, `test_supervisor_observability`,
 `test_supervisor_security`, `test_mcp_server`,
-`test_supervisor_stdio_integration`, `test_safety_eval`,
-`test_safety_eval_graph` and `test_safety_mutations`, all under `app/`.
+`test_supervisor_stdio_integration`, `test_usage`, `test_usage_wiring`,
+`test_safety_eval`, `test_safety_eval_graph` and `test_safety_mutations`,
+all under `app/`.
 
 The last three cover the safety evaluation, which drives the real gate
-and the real compiled graph against 65 scenarios and 15 invariants, and
-injects 12 faults that it must detect. Run it with
+and the real compiled graph against 68 scenarios and 16 invariants, and
+injects 14 faults that it must detect. Run it with
 `python -m app.evaluate_safety` (add `--mutations` for the fault
 injection). See `docs/safety-eval.md`.
 
@@ -429,6 +458,16 @@ injection). See `docs/safety-eval.md`.
   must validate every decision with `parse_decision` before it resumes
   the graph, and log rejected attempts itself. A bounded re-interrupt
   loop that records each rejected attempt is an option to revisit then.
+- No specialist in the Supervisor path calls a model yet, so usage
+  recording is exercised by tests, by scripted evaluation scenarios and by
+  the two RAG call sites when they run inside a collector. A model call
+  made from a thread that does not copy the calling context is not seen by
+  the collector (`asyncio.run` copies it, so the Kubernetes bridge is
+  covered). Prompt-cache tokens are not modelled, so a cost is inexact if
+  caching is used, and every cost is unknown until the price table is
+  filled in.
+- There is no token or cost ceiling: `CallLimits` caps call counts only.
+  A ceiling would change behavior and needs its own design.
 - The safety evaluation's fault injection cannot express structural
   faults in the graph's routing, such as an edge from `evaluate` to
   `execute`, because the conditional edges are closures inside

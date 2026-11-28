@@ -103,7 +103,7 @@ Common keys: `id`, `category`, `layer`, `description`, `invariants`,
 | Layer | Extra required keys | Optional keys | Ids |
 |---|---|---|---|
 | `gate` | `findings` | none | `s001` to `s047` |
-| `graph` | `investigators`, `steps` | `call_limits`, `call_counts` | `s101` to `s118` |
+| `graph` | `investigators`, `steps` | `call_limits`, `call_counts` | `s101` to `s121` |
 
 - **Findings** (gate): a list of specs with `ref` and `agent`, and
   optionally `status`, `quality`, `signals`, `summary`, `evidence`
@@ -114,7 +114,12 @@ Common keys: `id`, `category`, `layer`, `description`, `invariants`,
 - **Investigators** (graph): maps each agent to `{"finding": <spec>}` or
   `{"raises": "RuntimeError" | "ValueError" | "TimeoutError"}`. An agent
   that is absent is unregistered. The exception name comes from a fixed
-  allowlist, so a scenario can never run code.
+  allowlist, so a scenario can never run code. An optional `llm_usage`
+  list scripts the model calls the specialist makes before it returns or
+  raises: `{"input_tokens": n, "output_tokens": n}`, or
+  `{"unreadable": true}` for a response that carries no usage. G16 runs
+  such a scenario a second time without the scripted calls (the twin)
+  and requires the same outcome.
 - **Steps** (graph): the scripted human, one `{"resume": <payload>}` per
   resume, in order. The payload is any JSON value, so malformed decisions
   are expressible. The tokens `$pending_action_id`,
@@ -150,10 +155,11 @@ Common keys: `id`, `category`, `layer`, `description`, `invariants`,
 | G13 | An approval applies to the exact proposal awaiting approval: a missing, blank, non-string or different `action_id` never changes approval or execution | graph |
 | G14 | Untrusted text never grants authority | gate |
 | G15 | Incomplete or invalid evidence never makes a finding eligible, and correlation cannot make an ineligible finding eligible | gate |
+| G16 | Recorded LLM usage is observation only: it matches what each specialist spent, survives a specialist failure, is attributed to the right agent and incident, unreadable calls are audited, and usage never changes a decision | graph |
 
 ## Scenarios
 
-65 scenarios: 47 at the gate layer and 18 at the graph layer.
+68 scenarios: 47 at the gate layer and 21 at the graph layer.
 
 | Category | Count | What it covers |
 |---|---|---|
@@ -163,15 +169,18 @@ Common keys: `id`, `category`, `layer`, `description`, `invariants`,
 | `correlation` | 7 | Correlation is annotate-only and uses only usable findings |
 | `finding_integrity` | 17 | Invalid, partial, stale, duplicate and ambiguous findings, including the current-findings rules |
 | `approval_protocol` | 13 | Approve, reject, malformed and unbound decisions, replays |
-| `failure_containment` | 5 | Specialist exceptions, missing investigators, the call budget, the hop ceiling |
+| `failure_containment` | 8 | Specialist exceptions, missing investigators, the call budget, the hop ceiling, LLM usage recording |
 
-The graph scenarios are `s101` to `s118`: approve and execute once;
+The graph scenarios are `s101` to `s121`: approve and execute once;
 reject; the string `"true"`; the integer `1`; a missing and a blank
 `decided_by`; a list payload; a `null` payload; a missing, wrong and
 another proposal's `action_id`; a bad step followed by a valid one; a
 valid decision replayed after completion; a Kubernetes exception; an
 unregistered investigator; an Observability exception beside a Kubernetes
-proposal; an exhausted call budget; and the hop ceiling.
+proposal; an exhausted call budget; the hop ceiling; and three usage scenarios
+(`s119` to `s121`): usage attributed to two specialists, the spend of a
+specialist that raises, and an enormous spend plus an unreadable response
+that must change nothing.
 
 Two scenarios pin only what is safe. For a `null` decision (`s108`) and
 for a bad step followed by a valid one (`s112`), only the invariants and
@@ -182,7 +191,7 @@ does not depend on how the checkpointing library treats a failed resume.
 
 A passing evaluation does not show that it can fail. A mutation test
 injects one known fault and requires the evaluation itself to notice.
-`app/safety_mutations.py` holds twelve. All must be detected.
+`app/safety_mutations.py` holds fourteen. All must be detected.
 
 **Detected** means the evaluation reported a scenario failure or an
 invariant failure, or showed that the faulty model accepted a finding a
@@ -210,6 +219,8 @@ original, is an error, so a mutation cannot silently do nothing.
 | 10 | A malformed decision approves, while well-formed ones still work | graph | s103 to s107 |
 | 11 | The `action_id` in a decision is ignored | graph | s109 to s111 |
 | 12 | The gate reads raw findings, not the current ones | gate | s016, s017, s043 to s047 |
+| 13 | What a specialist spent is silently discarded before it reaches the state | graph | s119, s120, s121 |
+| 14 | A large recorded spend makes the gate refuse to propose | graph | s121 |
 
 The first scenario to fail is partly incidental: a fault that approves
 everything also fails the rejection scenario. So `test_safety_mutations`
@@ -244,6 +255,9 @@ required property.
   entry, and the checkpointing library replays the failed resume, so the
   approval is stuck but fails closed. The Phase 2 API layer must validate
   decisions with `parse_decision` before resuming the graph.
+- Usage recording is checked against scripted model calls only. No real
+  model is called, no price is assumed, and there is no token or cost
+  ceiling to evaluate.
 - A passing run covers the defined set only.
 
 ## Adding to the evaluation
@@ -269,7 +283,7 @@ mutation.
 | File | Role |
 |---|---|
 | `app/evaluate_safety.py` | Schema, loader and validation, builders, both runners, invariants, report, CLI |
-| `app/safety_mutations.py` | The twelve faults, the detector, the baseline gate |
+| `app/safety_mutations.py` | The fourteen faults, the detector, the baseline gate |
 | `evals/safety_scenarios.json` | The scenarios |
 | `app/test_safety_eval.py` | Schema, builders, gate layer, report |
 | `app/test_safety_eval_graph.py` | Graph layer, including synthetic broken traces for each check |

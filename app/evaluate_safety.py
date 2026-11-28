@@ -30,6 +30,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, get_args
 
 from pydantic import ValidationError
@@ -46,6 +47,7 @@ from app.state.models import (
 )
 from app.supervisor.correlation import annotate_action, correlate
 from app.supervisor.proposals import is_usable, propose_action
+from app.usage import record_llm_usage
 
 SCENARIO_PATH = (
     Path(__file__).resolve().parent.parent / "evals" / "safety_scenarios.json"
@@ -90,11 +92,14 @@ INVARIANTS: dict[str, str] = {
     "error messages cannot create a proposal or an approval.",
     "G15": "Incomplete or invalid evidence never makes a finding eligible, "
     "and correlation cannot make an ineligible finding eligible.",
+    "G16": "Recorded LLM usage is observation only: it matches what each "
+    "specialist spent, survives a specialist failure, is attributed to the "
+    "right agent, and never changes a decision.",
 }
 
 # The invariants each layer can check.
 GATE_INVARIANTS = ("G1", "G2", "G3", "G4", "G5", "G12", "G14", "G15")
-GRAPH_INVARIANTS = ("G6", "G7", "G8", "G9", "G10", "G11", "G13")
+GRAPH_INVARIANTS = ("G6", "G7", "G8", "G9", "G10", "G11", "G13", "G16")
 
 PROPOSALS = ("none", "rollout_restart")
 RISK_LEVELS = ("low", "medium", "high", "critical")
@@ -417,6 +422,24 @@ def _validate_graph_expect(scenario: dict[str, Any]) -> None:
         _require_str(expect["report_outcome"], "expect.report_outcome")
 
 
+def _validate_llm_usage(agent: str, items: Any) -> None:
+    """Scripted model calls: counts, or an unreadable response."""
+    if not isinstance(items, list):
+        raise ScenarioError(f"Investigator '{agent}' llm_usage must be a list.")
+    for item in items:
+        readable = (
+            isinstance(item, dict)
+            and set(item) == {"input_tokens", "output_tokens"}
+            and _is_int(item["input_tokens"], 0)
+            and _is_int(item["output_tokens"], 0)
+        )
+        if not (readable or item == {"unreadable": True}):
+            raise ScenarioError(
+                f"Investigator '{agent}' llm_usage items need non-negative "
+                "input_tokens and output_tokens, or exactly unreadable: true."
+            )
+
+
 def _validate_graph_scenario(scenario: dict[str, Any]) -> None:
     investigators = scenario["investigators"]
     if not isinstance(investigators, dict):
@@ -426,14 +449,12 @@ def _validate_graph_scenario(scenario: dict[str, Any]) -> None:
         raise ScenarioError(f"investigators names unknown agents {sorted(unknown)}.")
     specs: list[dict[str, Any]] = []
     for agent, entry in investigators.items():
-        if (
-            not isinstance(entry, dict)
-            or len(entry) != 1
-            or next(iter(entry)) not in ("finding", "raises")
-        ):
+        body = set(entry) - {"llm_usage"} if isinstance(entry, dict) else set()
+        if not isinstance(entry, dict) or len(body) != 1 or not body <= {"finding", "raises"}:
             raise ScenarioError(
                 f"Investigator '{agent}' needs exactly one of 'finding' or 'raises'."
             )
+        _validate_llm_usage(agent, entry.get("llm_usage", []))
         if "raises" in entry:
             if entry["raises"] not in RAISES:
                 raise ScenarioError(
@@ -1048,17 +1069,37 @@ class GraphImplementation:
 
 
 class ScriptedInvestigator:
-    """A specialist that returns a fixed finding or raises, and counts calls."""
+    """A specialist that returns a fixed finding or raises, and counts calls.
+
+    It can first make scripted model calls, so the evaluation can check how
+    usage reaches the state, even from a specialist that then fails. An
+    item with `unreadable` set reports a response that carries no usage.
+    """
 
     def __init__(
-        self, finding: Finding | None = None, error: Exception | None = None
+        self,
+        finding: Finding | None = None,
+        error: Exception | None = None,
+        usage: Sequence[dict[str, Any]] = (),
     ) -> None:
         self.finding = finding
         self.error = error
+        self.usage = list(usage)
         self.calls = 0
 
     def __call__(self, incident: IncidentContext) -> Finding | None:
         self.calls += 1
+        for item in self.usage:
+            if "unreadable" in item:
+                response = SimpleNamespace()
+            else:
+                response = SimpleNamespace(
+                    usage=SimpleNamespace(
+                        input_tokens=item["input_tokens"],
+                        output_tokens=item["output_tokens"],
+                    )
+                )
+            record_llm_usage(response, model="scripted-model")
         if self.error is not None:
             raise self.error
         return self.finding
@@ -1088,6 +1129,9 @@ class GraphRun:
     limits: Any
     scripted: dict[str, str]
     impl: GraphImplementation
+    scripted_usage: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    incident_id: str | None = None
+    twin: "GraphRun | None" = None
 
     @property
     def snapshots(self) -> list[Snapshot]:
@@ -1102,14 +1146,26 @@ class GraphRun:
 def _script_investigators(scenario: dict[str, Any]) -> dict[str, ScriptedInvestigator]:
     scripted: dict[str, ScriptedInvestigator] = {}
     for agent, entry in scenario["investigators"].items():
+        usage = entry.get("llm_usage", [])
         if "raises" in entry:
             name = entry["raises"]
             scripted[agent] = ScriptedInvestigator(
-                error=RAISES[name](f"scripted {name}")
+                error=RAISES[name](f"scripted {name}"), usage=usage
             )
         else:
-            scripted[agent] = ScriptedInvestigator(finding=build_finding(entry["finding"]))
+            scripted[agent] = ScriptedInvestigator(
+                finding=build_finding(entry["finding"]), usage=usage
+            )
     return scripted
+
+
+def _without_usage(scenario: dict[str, Any]) -> dict[str, Any]:
+    """The same scenario with its scripted model calls removed (the twin)."""
+    investigators = {
+        agent: {key: value for key, value in entry.items() if key != "llm_usage"}
+        for agent, entry in scenario["investigators"].items()
+    }
+    return {**scenario, "investigators": investigators}
 
 
 def _substitute(value: Any, tokens: dict[str, str]) -> Any:
@@ -1225,7 +1281,7 @@ def _execute_graph_scenario(scenario: dict[str, Any], impl: GraphImplementation)
             steps.append(
                 _invoke_once(path, investigators, impl, config, Command(resume=payload))
             )
-    return GraphRun(
+    run = GraphRun(
         scenario=scenario,
         initial=initial,
         steps=steps,
@@ -1238,7 +1294,16 @@ def _execute_graph_scenario(scenario: dict[str, Any], impl: GraphImplementation)
             for agent, entry in scenario["investigators"].items()
         },
         impl=impl,
+        scripted_usage={
+            agent: list(entry["llm_usage"])
+            for agent, entry in scenario["investigators"].items()
+            if entry.get("llm_usage")
+        },
+        incident_id=build_incident(scenario["incident"]).incident_id,
     )
+    if run.scripted_usage:
+        run.twin = _execute_graph_scenario(_without_usage(scenario), impl)
+    return run
 
 
 # Independent restatements of what a valid, bound decision is.
@@ -1434,6 +1499,66 @@ def _check_g13(run: GraphRun) -> list[str]:
     return problems
 
 
+def _signature(run: GraphRun) -> dict[str, Any]:
+    """What a run decided, ignoring usage and the audit entry about it."""
+    values = run.final.values
+    action = values.get("proposed_action")
+    approval = values.get("approval")
+    report = values.get("report")
+    return {
+        "proposal": None
+        if action is None
+        else (action.action_type, action.namespace, action.target, action.risk_level),
+        "approval": None if approval is None else approval.status,
+        "executed": values.get("execution") is not None,
+        "findings": {f.agent_name: f.status for f in values.get("findings", [])},
+        "paused": bool(run.final.next),
+        "report": None if report is None else report.outcome,
+        "events": [e for e in _audit_events(values) if e != "usage_not_recorded"],
+        "raised": [s.raised is not None for s in [run.initial, *run.steps]],
+    }
+
+
+def _check_g16(run: GraphRun) -> list[str]:
+    problems = []
+    values = run.final.values
+    records = values.get("usage", [])
+    expected: dict[str, list[tuple[int, int]]] = {}
+    unreadable_agents = 0
+    for agent, items in run.scripted_usage.items():
+        if run.initial.calls.get(agent, 0) == 0:
+            continue
+        expected[agent] = [
+            (i["input_tokens"], i["output_tokens"]) for i in items if "unreadable" not in i
+        ]
+        unreadable_agents += any("unreadable" in i for i in items)
+    seen: dict[str, list[tuple[int, int]]] = {}
+    for record in records:
+        seen.setdefault(record.agent_name, []).append(
+            (record.input_tokens, record.output_tokens)
+        )
+    for agent in sorted(set(seen) | set(expected)):
+        want, got = expected.get(agent, []), seen.get(agent, [])
+        if got != want:
+            problems.append(f"{agent}: recorded usage {got} does not match what it spent {want}")
+    if run.incident_id is not None:
+        wrong = sorted({r.incident_id for r in records if r.incident_id != run.incident_id})
+        if wrong:
+            problems.append(f"usage is attributed to another incident {wrong}")
+    audited = _audit_events(values).count("usage_not_recorded")
+    if audited != unreadable_agents:
+        problems.append(
+            f"{unreadable_agents} specialist(s) made unreadable calls but "
+            f"usage_not_recorded was audited {audited} time(s)"
+        )
+    if run.twin is not None:
+        mine, theirs = _signature(run), _signature(run.twin)
+        changed = sorted(key for key in mine if mine[key] != theirs[key])
+        if changed:
+            problems.append(f"recorded usage changed the outcome: {changed}")
+    return problems
+
+
 GRAPH_CHECKS: dict[str, Callable[[GraphRun], list[str]]] = {
     "G6": _check_g6,
     "G7": _check_g7,
@@ -1442,6 +1567,7 @@ GRAPH_CHECKS: dict[str, Callable[[GraphRun], list[str]]] = {
     "G10": _check_g10,
     "G11": _check_g11,
     "G13": _check_g13,
+    "G16": _check_g16,
 }
 assert set(GRAPH_CHECKS) == set(GRAPH_INVARIANTS)
 

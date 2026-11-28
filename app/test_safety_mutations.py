@@ -40,11 +40,11 @@ def outcomes(scenarios):
 
 # ---- the real mutations ----
 
-def test_there_are_twelve_unique_mutations_across_both_layers():
+def test_the_mutations_are_unique_and_cover_both_layers():
     names = [m.name for m in MUTATIONS]
-    assert len(names) == len(set(names)) == 12
+    assert len(names) == len(set(names)) == 14
     assert sum(m.layer == "gate" for m in MUTATIONS) == 7
-    assert sum(m.layer == "graph" for m in MUTATIONS) == 5
+    assert sum(m.layer == "graph" for m in MUTATIONS) == 7
 
 
 @pytest.mark.parametrize("name", [m.name for m in MUTATIONS])
@@ -246,6 +246,8 @@ INTENDED_CATCHERS = {
     "malformed_decision_reaches_execution": ["s103", "s104", "s105", "s106", "s107"],
     "wrong_or_replayed_action_id_accepted": ["s109", "s110", "s111"],
     "gate_uses_raw_findings": ["s016", "s017", "s043", "s044", "s045", "s046", "s047"],
+    "usage_silently_dropped": ["s119", "s120", "s121"],
+    "usage_influences_the_proposal": ["s121"],
 }
 
 
