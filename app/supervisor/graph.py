@@ -23,12 +23,14 @@ from app.state.models import (
     Finding,
     IncidentReport,
     SpecialistName,
+    UsageRecord,
 )
 from app.supervisor.correlation import annotate_action
 from app.supervisor.correlation import correlate as compute_correlations
 from app.supervisor.investigators import Investigator
 from app.supervisor.proposals import is_usable, propose_action
 from app.supervisor.routing import route_incident
+from app.usage import track_usage
 
 MAX_REPORT_CHARS = 800
 
@@ -161,6 +163,7 @@ def build_supervisor_graph(
         new_counts: dict[str, int] = {}
         findings: list[Finding] = []
         entries: list[AuditEntry] = []
+        usage: list[UsageRecord] = []
 
         for agent in state["routing"].selected_agents:
             investigator = investigators.get(agent)
@@ -177,23 +180,39 @@ def build_supervisor_graph(
 
             counts[agent] = counts.get(agent, 0) + 1
             new_counts[agent] = 1
-            try:
-                finding = investigator(incident)
-                event = f"{agent}_investigated"
-            except Exception as exc:  # contain specialist failures
-                finding = Finding(
-                    agent_name=agent,
-                    summary=f"{agent} investigation failed.",
-                    status="failed",
-                    error_message=str(exc),
-                )
-                event = f"{agent}_failed"
+            # Usage is observation only: the collector records what the
+            # specialist spends, including when it fails, and nothing here
+            # reads it back to decide anything.
+            with track_usage(incident.incident_id, agent) as collector:
+                try:
+                    finding = investigator(incident)
+                    event = f"{agent}_investigated"
+                except Exception as exc:  # contain specialist failures
+                    finding = Finding(
+                        agent_name=agent,
+                        summary=f"{agent} investigation failed.",
+                        status="failed",
+                        error_message=str(exc),
+                    )
+                    event = f"{agent}_failed"
+            usage.extend(collector.records)
             findings.append(finding)
             entries.append(audit(state, agent, event))
+            if collector.dropped or collector.warnings:
+                entries.append(
+                    audit(
+                        state,
+                        "supervisor",
+                        "usage_not_recorded",
+                        f"{agent}: {collector.dropped} call(s) not recorded, "
+                        f"{len(collector.warnings)} warning(s)",
+                    )
+                )
 
         return {
             "findings": findings,
             "agent_call_counts": new_counts,
+            "usage": usage,
             "audit_log": entries,
         }
 

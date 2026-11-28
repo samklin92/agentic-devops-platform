@@ -6,6 +6,7 @@ from typing import Any
 import anthropic
 
 from app.generator import DEFAULT_MODEL
+from app.usage import record_llm_usage
 
 
 EVALUATION_SYSTEM_PROMPT = """
@@ -111,6 +112,7 @@ def evaluate_answer_grounding(
             }
         ],
     )
+    record_llm_usage(response, model=model)
 
     text_blocks = [
         block.text

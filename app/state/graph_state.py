@@ -108,14 +108,27 @@ def supervisor_hops_exhausted(state: PlatformState) -> bool:
 def summarize_usage(
     records: list[UsageRecord],
 ) -> dict[str, dict[str, float | int]]:
-    """Aggregate LLM usage and estimated cost per agent."""
+    """Aggregate LLM usage and estimated cost per agent.
+
+    `estimated_cost_usd` sums only the calls that have a price, so when
+    `unpriced_calls` is above zero it is a lower bound and not a total.
+    A call with no price is counted, never treated as free.
+    """
     summary: dict[str, dict[str, float | int]] = {}
     for record in records:
         entry = summary.setdefault(
             record.agent_name,
-            {"calls": 0, "total_tokens": 0, "estimated_cost_usd": 0.0},
+            {
+                "calls": 0,
+                "total_tokens": 0,
+                "estimated_cost_usd": 0.0,
+                "unpriced_calls": 0,
+            },
         )
         entry["calls"] += 1
         entry["total_tokens"] += record.total_tokens
-        entry["estimated_cost_usd"] += record.estimated_cost_usd or 0.0
+        if record.estimated_cost_usd is None:
+            entry["unpriced_calls"] += 1
+        else:
+            entry["estimated_cost_usd"] += record.estimated_cost_usd
     return summary

@@ -349,3 +349,26 @@ def test_signal_and_gate_agree_on_usable_findings():
         assert is_usable(finding)
         proposed = propose_action(incident, [finding]) is not None
         assert proposed == ("crash_loop" in finding.signals)
+
+
+def test_summarize_usage_counts_unpriced_calls_and_never_treats_them_as_free():
+    priced = UsageRecord(
+        incident_id="i",
+        agent_name="kubernetes",
+        model="test-model",
+        input_tokens=1,
+        output_tokens=1,
+        estimated_cost_usd=0.5,
+    )
+    unpriced = UsageRecord(
+        incident_id="i",
+        agent_name="kubernetes",
+        model="test-model",
+        input_tokens=1,
+        output_tokens=1,
+    )
+    summary = summarize_usage([priced, unpriced, unpriced])["kubernetes"]
+    assert summary["calls"] == 3
+    assert summary["unpriced_calls"] == 2
+    # A lower bound: only the priced call contributes.
+    assert summary["estimated_cost_usd"] == 0.5

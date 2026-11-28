@@ -3,6 +3,8 @@ import os
 import anthropic
 from dotenv import load_dotenv
 
+from app.usage import record_llm_usage
+
 load_dotenv()
 
 DEFAULT_MODEL = "claude-sonnet-4-6"
@@ -107,6 +109,7 @@ def generate_answer(
             }
         ],
     )
+    record_llm_usage(response, model=model)
 
     text_blocks = [
         block.text
