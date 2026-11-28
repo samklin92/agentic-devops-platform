@@ -234,12 +234,27 @@ def diagnostic_evidence(observation: str) -> AgentEvidence:
     return AgentEvidence(source_tool="get_pod_status", observation=observation)
 
 
+def pod_evidence(
+    status,
+    tool: str = "gather_additional_diagnostics",
+    **extra,
+) -> AgentEvidence:
+    import json
+
+    payload = {
+        "pod": {"name": "inventory-api", "status": status},
+        **extra,
+        "terminal": True,
+    }
+    return AgentEvidence(source_tool=tool, observation=json.dumps(payload))
+
+
 def kubernetes_response(**overrides) -> KubernetesInvestigationResponse:
     data = {
         "incident_id": "inc-001",
         "status": "completed",
         "findings": ["get_pod_status: CrashLoopBackOff"],
-        "evidence": [diagnostic_evidence("CrashLoopBackOff")],
+        "evidence": [pod_evidence("CrashLoopBackOff")],
         "evidence_quality": "limited",
     }
     data.update(overrides)
@@ -303,12 +318,115 @@ def test_signal_survives_a_failed_run_beside_real_evidence():
     finding = finding_from_kubernetes_response(
         kubernetes_response(
             evidence=[
-                diagnostic_evidence("CrashLoopBackOff"),
+                pod_evidence("CrashLoopBackOff"),
                 failure_evidence("get_pod_events"),
             ]
         )
     )
     assert finding.signals == ["crash_loop"]
+
+
+def test_negation_text_beside_a_healthy_pod_carries_no_signal():
+    finding = finding_from_kubernetes_response(
+        kubernetes_response(
+            findings=["Pod is Running; no crash loop detected"],
+            evidence=[
+                pod_evidence("Running", note="no crash loop detected")
+            ],
+        )
+    )
+    assert finding.signals == []
+
+
+def test_crash_loop_text_in_logs_or_events_cannot_set_the_signal():
+    finding = finding_from_kubernetes_response(
+        kubernetes_response(
+            findings=["workload printed crash loop"],
+            evidence=[
+                pod_evidence(
+                    "Running",
+                    logs=["crash loop", "CrashLoopBackOff"],
+                    events=[{"message": "CrashLoopBackOff"}],
+                    deployment={"status": "CrashLoopBackOff"},
+                    restarts=12,
+                )
+            ],
+        )
+    )
+    assert finding.signals == []
+
+
+def test_a_text_only_observation_no_longer_sets_the_signal():
+    finding = finding_from_kubernetes_response(
+        kubernetes_response(
+            evidence=[diagnostic_evidence("CrashLoopBackOff")]
+        )
+    )
+    assert finding.signals == []
+
+
+def test_the_summary_alone_cannot_set_the_signal():
+    finding = finding_from_kubernetes_response(
+        kubernetes_response(
+            findings=["Pod is in CrashLoopBackOff"],
+            evidence=[pod_evidence("Running")],
+        )
+    )
+    assert finding.signals == []
+
+
+def test_conflicting_pod_statuses_carry_no_signal():
+    finding = finding_from_kubernetes_response(
+        kubernetes_response(
+            evidence=[
+                pod_evidence("CrashLoopBackOff"),
+                pod_evidence("Running", tool="inspect_pod_events"),
+            ]
+        )
+    )
+    assert finding.signals == []
+
+
+@pytest.mark.parametrize(
+    "pod",
+    [None, "CrashLoopBackOff", ["x"], {}, {"status": None}, {"status": 5}],
+)
+def test_an_invalid_pod_beside_a_crash_loop_carries_no_signal(pod):
+    import json
+
+    invalid = AgentEvidence(
+        source_tool="gather_additional_diagnostics",
+        observation=json.dumps({"pod": pod}),
+    )
+    finding = finding_from_kubernetes_response(
+        kubernetes_response(
+            evidence=[pod_evidence("CrashLoopBackOff"), invalid]
+        )
+    )
+    assert finding.signals == []
+
+
+def test_observations_without_a_pod_are_ignored_beside_a_crash_loop():
+    no_pod = AgentEvidence(
+        source_tool="inspect_pod_events",
+        observation='{"events": [{"message": "Back-off"}]}',
+    )
+    not_json = AgentEvidence(
+        source_tool="inspect_pod_events", observation="not json"
+    )
+    finding = finding_from_kubernetes_response(
+        kubernetes_response(
+            evidence=[no_pod, pod_evidence("CrashLoopBackOff"), not_json]
+        )
+    )
+    assert finding.signals == ["crash_loop"]
+
+
+def test_the_status_match_is_exact_and_case_sensitive():
+    finding = finding_from_kubernetes_response(
+        kubernetes_response(evidence=[pod_evidence("crashloopbackoff")])
+    )
+    assert finding.signals == []
 
 
 @pytest.mark.parametrize("status", ["failed", "blocked"])
