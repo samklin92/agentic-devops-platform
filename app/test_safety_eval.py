@@ -76,7 +76,7 @@ def test_seed_file_is_valid_and_uses_only_known_vocabulary():
 
 
 def test_every_global_invariant_has_a_description():
-    assert set(INVARIANTS) == {f"G{n}" for n in range(1, 17)}
+    assert set(INVARIANTS) == {f"G{n}" for n in range(1, 18)}
     assert all(text.strip() for text in INVARIANTS.values())
 
 

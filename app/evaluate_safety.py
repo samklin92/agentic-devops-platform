@@ -35,7 +35,11 @@ from typing import Any, get_args
 
 from pydantic import ValidationError
 
-from app.contracts.agent_messages import AgentEvidence
+from app.contracts.agent_messages import (
+    AgentEvidence,
+    KubernetesInvestigationResponse,
+)
+from app.state import adapters as adapter_module
 from app.state.models import (
     SIGNALS_BY_AGENT,
     CallLimits,
@@ -95,10 +99,14 @@ INVARIANTS: dict[str, str] = {
     "G16": "Recorded LLM usage is observation only: it matches what each "
     "specialist spent, survives a specialist failure, is attributed to the "
     "right agent, and never changes a decision.",
+    "G17": "A finding built from a Kubernetes response carries crash_loop "
+    "exactly when its status is not failed or blocked, a diagnostic "
+    "observation exists and every structured pod status in the diagnostic "
+    "observations is exactly CrashLoopBackOff. Text never counts.",
 }
 
 # The invariants each layer can check.
-GATE_INVARIANTS = ("G1", "G2", "G3", "G4", "G5", "G12", "G14", "G15")
+GATE_INVARIANTS = ("G1", "G2", "G3", "G4", "G5", "G12", "G14", "G15", "G17")
 GRAPH_INVARIANTS = ("G6", "G7", "G8", "G9", "G10", "G11", "G13", "G16")
 
 PROPOSALS = ("none", "rollout_restart")
@@ -189,10 +197,43 @@ def build_finding(
     return factory(**kwargs)
 
 
+def _observation_text(value: Any) -> str:
+    """An evidence observation as the agent stores it: a string or JSON."""
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, default=str)
+
+
+def build_response(
+    spec: dict[str, Any], incident_id: str
+) -> KubernetesInvestigationResponse:
+    """Build a real Kubernetes agent response from a scenario's response spec."""
+    status = spec.get("status", "completed")
+    evidence = [
+        AgentEvidence(
+            source_tool=item["tool"],
+            observation=_observation_text(item["observation"]),
+        )
+        for item in spec.get("evidence", [])
+    ]
+    return KubernetesInvestigationResponse(
+        incident_id=incident_id,
+        agent_name="kubernetes",
+        status=status,
+        findings=list(spec.get("findings", [])),
+        evidence=evidence,
+        evidence_quality=spec.get("quality", "limited"),
+        needs_follow_up=spec.get("needs_follow_up", status != "completed"),
+        error_message=spec.get("error_message"),
+    )
+
+
 @dataclass
 class BuiltFindings:
     findings: dict[str, Finding]
     rejected: list[str]
+    # The Kubernetes response behind each finding that was built from one.
+    responses: dict[str, Any] = field(default_factory=dict)
 
     def ordered(self) -> list[Finding]:
         return list(self.findings.values())
@@ -208,9 +249,26 @@ def build_findings(
     scenario, not a safety result.
     """
     built: dict[str, Finding] = {}
+    responses: dict[str, Any] = {}
     rejected: list[str] = []
+    incident_id = {**DEFAULT_INCIDENT, **(scenario.get("incident") or {})}[
+        "incident_id"
+    ]
     for spec in scenario["findings"]:
         ref = spec["ref"]
+        if "response" in spec:
+            # A response goes through the real adapter, so the signal it
+            # carries is whatever the adapter derives, not what the file says.
+            try:
+                response = build_response(spec["response"], incident_id)
+            except ValidationError as exc:
+                raise ScenarioError(
+                    f"Response '{ref}' was rejected by the contract: "
+                    f"{exc.errors()[0]['msg']}"
+                ) from exc
+            responses[ref] = response
+            built[ref] = adapter_module.finding_from_kubernetes_response(response)
+            continue
         try:
             finding = build_finding(spec, factory)
         except ValidationError as exc:
@@ -225,7 +283,7 @@ def build_findings(
                 f"Finding '{ref}' is marked expect_invalid but the model accepted it."
             )
         built[ref] = finding
-    return BuiltFindings(findings=built, rejected=rejected)
+    return BuiltFindings(findings=built, rejected=rejected, responses=responses)
 
 
 # --- loading and validation ----------------------------------------------
@@ -236,6 +294,79 @@ def _require_str(value: Any, what: str) -> None:
         raise ScenarioError(f"{what} must be a non-empty string.")
 
 
+_RESPONSE_SPEC_KEYS = {"ref", "response", "expect_signal"}
+_RESPONSE_KEYS = {
+    "status",
+    "findings",
+    "evidence",
+    "quality",
+    "needs_follow_up",
+    "error_message",
+}
+
+
+def _validate_response_spec(spec: dict[str, Any]) -> None:
+    """Validate a finding that is built from a Kubernetes agent response."""
+    ref = spec.get("ref")
+    _require_str(ref, "Finding ref")
+    unknown = spec.keys() - _RESPONSE_SPEC_KEYS
+    if unknown:
+        raise ScenarioError(
+            f"Response finding '{ref}' has unknown keys {sorted(unknown)}."
+        )
+    if not isinstance(spec.get("expect_signal"), bool):
+        raise ScenarioError(f"Response finding '{ref}' needs a boolean expect_signal.")
+    response = spec["response"]
+    if not isinstance(response, dict):
+        raise ScenarioError(f"Response of '{ref}' must be an object.")
+    unknown = response.keys() - _RESPONSE_KEYS
+    if unknown:
+        raise ScenarioError(f"Response of '{ref}' has unknown keys {sorted(unknown)}.")
+    if response.get("status", "completed") not in FINDING_STATUSES:
+        raise ScenarioError(
+            f"Response of '{ref}' status must be one of {list(FINDING_STATUSES)}."
+        )
+    texts = response.get("findings", [])
+    if not isinstance(texts, list) or not all(isinstance(t, str) for t in texts):
+        raise ScenarioError(f"Response of '{ref}' findings must be a list of strings.")
+    evidence = response.get("evidence", [])
+    if not isinstance(evidence, list):
+        raise ScenarioError(f"Response of '{ref}' evidence must be a list.")
+    for item in evidence:
+        if not isinstance(item, dict) or set(item) != _EVIDENCE_KEYS:
+            raise ScenarioError(
+                f"Response of '{ref}' evidence items need exactly "
+                f"{sorted(_EVIDENCE_KEYS)}."
+            )
+        _require_str(item["tool"], f"Response of '{ref}' evidence tool")
+        if not isinstance(item["observation"], (str, dict, list)):
+            raise ScenarioError(
+                f"Response of '{ref}' observations must be a string or a JSON "
+                "object or list."
+            )
+    if not isinstance(response.get("quality", "limited"), str):
+        raise ScenarioError(f"Response of '{ref}' quality must be a string.")
+    if not isinstance(response.get("needs_follow_up", False), bool):
+        raise ScenarioError(f"Response of '{ref}' needs_follow_up must be a boolean.")
+    message = response.get("error_message")
+    if message is not None and not isinstance(message, str):
+        raise ScenarioError(f"Response of '{ref}' error_message must be a string.")
+    try:
+        built = build_response(response, "validation")
+    except ValidationError as exc:
+        raise ScenarioError(
+            f"Response of '{ref}' was rejected by the contract: "
+            f"{exc.errors()[0]['msg']}"
+        ) from exc
+    computed = _oracle_crash_loop(built)
+    if computed != spec["expect_signal"]:
+        raise ScenarioError(
+            f"Response finding '{ref}' states expect_signal="
+            f"{spec['expect_signal']} but the independent oracle computes "
+            f"{computed}."
+        )
+
+
 def _validate_findings(scenario: dict[str, Any]) -> None:
     specs = scenario["findings"]
     if not isinstance(specs, list) or not specs:
@@ -244,6 +375,10 @@ def _validate_findings(scenario: dict[str, Any]) -> None:
     for spec in specs:
         if not isinstance(spec, dict):
             raise ScenarioError("Each finding spec must be an object.")
+        if "response" in spec:
+            _validate_response_spec(spec)
+            refs.append(spec["ref"])
+            continue
         missing = _FINDING_REQUIRED - spec.keys()
         if missing:
             raise ScenarioError(f"Finding is missing {sorted(missing)}.")
@@ -954,6 +1089,65 @@ def _check_g15(run: GateRun) -> list[str]:
     return problems
 
 
+def _oracle_pod_statuses(observations: list[str]) -> list[str] | None:
+    """The structured pod statuses in order, or None if any pod is invalid."""
+    statuses: list[str] = []
+    for raw in observations:
+        try:
+            payload = json.loads(raw)
+        except (TypeError, ValueError, RecursionError):
+            continue
+        if not isinstance(payload, dict) or "pod" not in payload:
+            continue
+        pod = payload["pod"]
+        if not isinstance(pod, dict) or not isinstance(pod.get("status"), str):
+            return None
+        statuses.append(pod["status"])
+    return statuses
+
+
+def _oracle_crash_loop(response: KubernetesInvestigationResponse) -> bool:
+    """An independent restatement of the structured crash_loop rule.
+
+    It does not import the production helper, so a fault there cannot pass
+    its own check.
+    """
+    if response.status in ("failed", "blocked"):
+        return False
+    diagnostic: list[str] = []
+    for item in response.evidence:
+        try:
+            payload = json.loads(item.observation)
+        except (TypeError, ValueError, RecursionError):
+            payload = None
+        failed_run = (
+            isinstance(payload, dict) and payload.get("execution_failed") is True
+        )
+        if not failed_run:
+            diagnostic.append(item.observation)
+    if not diagnostic:
+        return False
+    statuses = _oracle_pod_statuses(diagnostic)
+    return bool(statuses) and set(statuses) == {"CrashLoopBackOff"}
+
+
+def _check_g17(run: GateRun) -> list[str]:
+    problems = []
+    for ref, response in run.built.responses.items():
+        finding = run.built.findings[ref]
+        expected = _oracle_crash_loop(response)
+        carries = "crash_loop" in finding.signals
+        if carries != expected:
+            problems.append(
+                f"{ref} {'carries' if carries else 'lacks'} crash_loop but the "
+                f"structured pod status says it should "
+                f"{'carry' if expected else 'not carry'} it"
+            )
+        if set(finding.signals) - {"crash_loop"}:
+            problems.append(f"{ref} carries signals other than crash_loop")
+    return problems
+
+
 GATE_CHECKS: dict[str, Callable[[GateRun], list[str]]] = {
     "G1": _check_g1,
     "G2": _check_g2,
@@ -963,6 +1157,7 @@ GATE_CHECKS: dict[str, Callable[[GateRun], list[str]]] = {
     "G12": _check_g12,
     "G14": _check_g14,
     "G15": _check_g15,
+    "G17": _check_g17,
 }
 assert set(GATE_CHECKS) == set(GATE_INVARIANTS)
 
@@ -981,6 +1176,17 @@ def _describe_run(run: GateRun) -> str:
 def _check_expectation(scenario: dict[str, Any], run: GateRun) -> list[str]:
     expect = scenario["expect"]
     failures = []
+    for spec in scenario["findings"]:
+        if "response" not in spec:
+            continue
+        finding = run.built.findings.get(spec["ref"])
+        carries = finding is not None and "crash_loop" in finding.signals
+        if carries != spec["expect_signal"]:
+            failures.append(
+                f"expected {spec['ref']} to "
+                f"{'carry' if spec['expect_signal'] else 'not carry'} crash_loop, "
+                f"it {'does' if carries else 'does not'}"
+            )
     got = "none" if run.action is None else run.action.action_type
     if got != expect["proposal"]:
         failures.append(f"expected proposal {expect['proposal']!r}, got {got!r}")
